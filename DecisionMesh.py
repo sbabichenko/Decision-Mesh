@@ -9,25 +9,51 @@ from matplotlib.patches import Polygon
 from matplotlib.collections import PatchCollection
 
 
+class TreeNode:
+    def __init__(self, mesh, parent: 'TreeNode' = None, face: 'Face' = None):
+        self.parent = parent
+        self.split_criterion = None
+        self.face = face
+        self.mesh = mesh
+        if face:
+            self.face.addnode(self)
+    
+
+    def is_leaf(self):
+        return self.split_criterion is None
+    
+    def split(self, edge: 'Edge', plus: 'Face', minus: 'Face'):
+        self.split_criterion = {'normal': edge.normal, 'intercept': edge.intercept}
+        self.children = {'+': TreeNode(self.mesh, self, plus), '-': TreeNode(self.mesh, self, minus)}
+        self.mesh.leaves.remove(self)
+        self.mesh.leaves.add(self.children['+'])
+        self.mesh.leaves.add(self.children['-'])
 class DecisionMesh:
     
     
     def __init__(self, df : pd.DataFrame):
-        self.data = df
+        self.X = df.iloc[:, :2].to_numpy()
+        self.residuals = df.iloc[:,2].to_numpy()
         self.index = df.index
+        self.root = TreeNode(self)
+        self.leaves = set()
+        self.leaves.add(self.root)
+        self.active_faces = set()
+        self.active_vertices = set()
+        self.active_edges = set()
         
         
         #dict with vertices as keys and masks as ownership
         self.ownership = defaultdict(self._empty_mask)
         self.coefficients = defaultdict(self._empty_coeff)
+        self.midpoints = set()
         
         self.create_outer_vertices()
         self.create_outer_edges()
         
-        self.split_edge = Edge(self, self.outer_vertices['bottom_left'],self.outer_vertices['top_right'], True)
         
-        self.top_face = Face(self, self.split_edge,self.outer_edges['left'],self.outer_edges['top'])
-        self.bottom_face = Face(self, self.split_edge, self.outer_edges['bottom'], self.outer_edges['right'])
+        
+
         self.first_split()
     
     def _empty_mask(self) -> pd.Series:
@@ -39,22 +65,30 @@ class DecisionMesh:
         return pd.Series(0.0, index=self.index, dtype=float)
     
     def first_split(self):
-        P = self.data.iloc[:, :2].to_numpy()
-        mask = (P @ self.split_edge.normal) >= self.split_edge.intercept
+        
+        self.split_edge = Edge(self, self.outer_vertices['bottom_left'],self.outer_vertices['top_right'], True)
+        self.top_face = Face(self, self.split_edge,self.outer_edges['left'],self.outer_edges['top'], path = '+')
+        self.bottom_face = Face(self, self.split_edge, self.outer_edges['bottom'], self.outer_edges['right'], path = '-')
+        self.root.split(self.split_edge, self.top_face, self.bottom_face)
+        mask = (self.X @ self.split_edge.normal) >= self.split_edge.intercept
         self.top_face.update_mask(mask)
         self.bottom_face.update_mask(~mask)
         self.regress_and_assign()
         
     def create_outer_vertices(self):
-        self.xmin = self.data.iloc[:,0].min()
-        self.xmax = self.data.iloc[:,0].max()
-        self.ymin = self.data.iloc[:,1].min()
-        self.ymax = self.data.iloc[:,1].max()
+        self.xmin = self.X[:,0].min()
+        self.xmax = self.X[:,0].max()
+        self.ymin = self.X[:,1].min()
+        self.ymax = self.X[:,1].max()
         self.outer_vertices = dict()
-        self.outer_vertices['bottom_left'] = Vertex(self, self.xmin,self.ymin)
-        self.outer_vertices['top_left'] = Vertex(self, self.xmin,self.ymax)
-        self.outer_vertices['bottom_right'] = Vertex(self, self.xmax,self.ymin)
-        self.outer_vertices['top_right'] = Vertex(self, self.xmax,self.ymax)
+        self.outer_vertices['bottom_left'] = Vertex(self, self.xmin,self.ymin, True)
+        self.outer_vertices['top_left'] = Vertex(self, self.xmin,self.ymax, True)
+        self.outer_vertices['bottom_right'] = Vertex(self, self.xmax,self.ymin, True)
+        self.outer_vertices['top_right'] = Vertex(self, self.xmax,self.ymax, True)
+        
+        for vertex in self.outer_vertices.values():
+            self.active_vertices.add(vertex)
+            self.coefficients[vertex]
 
     def create_outer_edges(self):
         self.outer_edges = dict()
@@ -62,6 +96,8 @@ class DecisionMesh:
         self.outer_edges['bottom'] = Edge(self, self.outer_vertices['bottom_right'],self.outer_vertices['bottom_left'], True)
         self.outer_edges['right'] = Edge(self, self.outer_vertices['top_right'],self.outer_vertices['bottom_right'], True)
         self.outer_edges['top'] = Edge(self, self.outer_vertices['top_right'],self.outer_vertices['top_left'], True)
+        for edge in self.outer_edges.values():
+            self.active_edges.add(edge)
     
     def _all_vertices(self):
         """Return a stable list of unique vertices in this mesh."""
@@ -78,7 +114,7 @@ class DecisionMesh:
         Color the mesh by linearly interpolated vertex heights using Gouraud shading.
         Assumes each vertex has .height set (e.g., via regress_and_assign()).
         """
-        verts = self._all_vertices()
+        verts = self.active_vertices
         idx = {v: i for i, v in enumerate(verts)}
         xs  = [v.x for v in verts]
         ys  = [v.y for v in verts]
@@ -86,7 +122,7 @@ class DecisionMesh:
 
         # Triangles from faces
         tris = []
-        for f in [self.top_face, self.bottom_face]:
+        for f in self.active_faces:
             tris.append([idx[v] for v in f.vertices])
         tris = np.asarray(tris, dtype=int)
 
@@ -98,7 +134,7 @@ class DecisionMesh:
 
         if draw_edges:
             # overlay edges for crisp boundaries
-            for edge in list(self.outer_edges.values()) + [self.split_edge]:
+            for edge in list(self.active_edges):
                 ax.plot([edge.vertex0.x, edge.vertex1.x],
                         [edge.vertex0.y, edge.vertex1.y],
                         "k-", lw=1.0, alpha=0.9)
@@ -120,22 +156,25 @@ class DecisionMesh:
         """
         # Build dense design matrix (columns are Vertex objects)
         X_df = pd.DataFrame({v: s for v, s in self.coefficients.items()}, index=self.index).astype(float)
-        y = self.data.iloc[:, target_col].astype(float).to_numpy()
 
         # Solve OLS
         X = X_df.to_numpy()
-        beta, *_ = np.linalg.lstsq(X, y, rcond=None)
+        beta, *_ = np.linalg.lstsq(X, self.residuals, rcond=None)
 
         # Assign back to vertices
         for j, v in enumerate(X_df.columns):
-            v.set_height(float(beta[j]))
+            v.add_height(float(beta[j]))
 
     
 class Vertex:
-    def __init__(self, mesh, x: float, y: float):
+    def __init__(self, mesh, x: float, y: float, active = False, parent_edge: 'Edge' = None):
         self.x = x
         self.y = y
         self.mesh = mesh
+        self.active = active
+        
+        self.parent_edge = parent_edge
+        self.height = 0.0  # will be set later by regression
         
         self.edges: set[Edge] = set()
         self.neighbors: set[Vertex] = set()
@@ -182,9 +221,25 @@ class Vertex:
         self.edges.add(edge)
         other = edge.other_vertex(self)
         self.neighbors.add(other)
+        
+    def remove_edge(self, edge):
+        self.edges.remove(edge)
+        other = edge.other_vertex(self)
+        if other in self.neighbors:
+            self.neighbors.remove(other)
     
-    def set_height(self, value: float):
-        self.height = float(value)
+    def add_height(self, value: float):
+        self.height += float(value)
+        
+    def activate(self):
+        self.active = True
+        self.mesh.active_vertices.add(self)
+        if self.parent_edge:
+            self.parent_edge.split()
+            
+    def regress_and_assign(self):
+        pass
+            
         
     @property
     def degree(self) -> int:
@@ -217,11 +272,31 @@ class Edge:
             
     
     def activate(self):
-        self.add_midpoint()
+        self.active = True
+        self.mesh.active_edges.add(self)
+        self.midpoint = Vertex(self.mesh, (self.vertex0.x + self.vertex1.x)/2, (self.vertex0.y + self.vertex1.y)/2, parent_edge=self)
+        self.mesh.midpoints.add(self.midpoint)
         self.vertex0.add_edge(self)
         self.vertex1.add_edge(self)
         self.sub_edges = {'0': Edge(self.mesh, self.vertex0, self.midpoint, False), '1': Edge(self.mesh, self.midpoint, self.vertex1, False),'+': None, '-': None}
+            
+    def split(self):
+        if self.faces['+']:
+            self.faces['+'].split(self)
+        if self.faces['-']:
+            self.faces['-'].split(self)
         
+        self.deactivate()
+        self.sub_edges['0'].activate()
+        self.sub_edges['1'].activate()
+            
+    def deactivate(self):
+        self.active = False
+        self.mesh.active_edges.remove(self)
+        self.vertex0.remove_edge(self)
+        self.vertex1.remove_edge(self)
+        self.mesh.midpoints.remove(self.midpoint)
+            
     def test_vertex(self, v: Vertex) -> bool:
         return np.array(v) @ self.normal - self.intercept  
         
@@ -229,40 +304,52 @@ class Edge:
         if v is self.vertex0: return self.vertex1
         if v is self.vertex1: return self.vertex0
         return None
+        
+        
     
-    def add_midpoint(self):
-        self.midpoint = Vertex(self.mesh, (self.vertex0.x + self.vertex1.x)/2, (self.vertex0.y + self.vertex1.y)/2)
-    
-    def add_face(self, face: 'Face', opposing_vertex: 'Vertex', active: bool = True):
-        if (opposing_vertex @ self.normal) >= self.intercept:
+    def add_face(self, face: 'Face'):
+        idx = face.edges.index(self)
+        opposing_vertex = face.vertices[idx]
+        if self.test_vertex(opposing_vertex) > 0:
             face_type = '+'
         else:
             face_type = '-'
             
         self.faces[face_type] = face
         self.opposing_vertices[face_type] = opposing_vertex
-        if active:
-            self.sub_edges[face_type] = Edge(self.mesh, self.midpoint, opposing_vertex, False)
-            idx = face.vertices.index(self.vertex1)
-            edge0 = face.edges[idx]
-            idx = face.vertices.index(self.vertex0)
-            edge1 = face.edges[idx]
-            face0 = Face(self.mesh, self.sub_edges[face_type], edge0, self.sub_edges['0'], False)
-            face1 = Face(self.mesh, self.sub_edges[face_type], edge1, self.sub_edges['1'], False)
-            if face_type == '+':
-                face.add_sub_division(self, {'e': self.sub_edges[face_type], '+': face0, '-': face1})
-            else:
-                face.add_sub_division(self, {'e': self.sub_edges[face_type], '+': face1, '-': face0})
+        
+        self.sub_edges[face_type] = Edge(self.mesh, self.midpoint, opposing_vertex, False)
+        idx = face.vertices.index(self.vertex1)
+        edge0 = face.edges[idx]
+        idx = face.vertices.index(self.vertex0)
+        edge1 = face.edges[idx]
+        face0 = Face(self.mesh, self.sub_edges[face_type], edge0, self.sub_edges['0'], False)
+        face1 = Face(self.mesh, self.sub_edges[face_type], edge1, self.sub_edges['1'], False)
+        if face_type == '+':
+            face0.path = face.path + '+'
+            face1.path = face.path + '-'
+            face.add_sub_division(self, {'e': self.sub_edges[face_type], '+': face0, '-': face1})
+        else:
+            face0.path = face.path + '-'
+            face1.path = face.path + '+'
+            face.add_sub_division(self, {'e': self.sub_edges[face_type], '+': face1, '-': face0})
     
     def remove_face(self, face):
-        pass
-
+        if self.faces['+'] is face:
+            self.faces['+'] = None
+        if self.faces['-'] is face:
+            self.faces['-'] = None
 class Face:
-    def __init__(self, mesh: DecisionMesh, edge0: 'Edge', edge1: 'Edge', edge2: 'Edge', active: bool = True):
+    def __init__(self, mesh: DecisionMesh, edge0: 'Edge', edge1: 'Edge', edge2: 'Edge', active: bool = True, path = ''):
+        self.path = path
         self.active = active
         self.mesh = mesh
+        self.node: None
         self.edges = [edge0, edge1, edge2]
-        self.sub_divisions = [{'e':None, '+':None,'-':None},{'e':None, '+':None,'-':None},{'e':None, '+':None,'-':None}]
+        self.sub_divisions = [{'e': None, '+': None, '-': None},
+                              {'e': None, '+': None, '-': None},
+                              {'e': None, '+': None, '-': None},]
+
         
         vertex1 = self.edges[0].vertex0
         vertex2 = self.edges[0].vertex1
@@ -275,11 +362,35 @@ class Face:
         self.vertices = [vertex0, vertex1, vertex2] 
         
         if active:
-            for i, edge in enumerate(self.edges):
-                edge.add_face(self, self.vertices[i], active)
+            self.activate()
                 
+    def addnode(self, node: TreeNode):
+        self.node = node
 
+    def split(self, edge: Edge):
+        idx = self.edges.index(edge)
+        sub_division = self.sub_divisions[idx]
+        if sub_division['e'] is None:
+            raise ValueError("Edge has not been activated/split yet.")
         
+        self.deactivate()
+        self.node.split(edge, sub_division['+'], sub_division['-'])
+        sub_division['+'].activate()
+        sub_division['-'].activate()
+        
+    def deactivate(self):
+        self.active = False
+        self.mesh.active_faces.remove(self)
+        for edge in self.edges:
+            edge.remove_face(self)
+            
+    def activate(self):
+        self.active = True
+        self.mesh.active_faces.add(self)
+        for edge in self.edges:
+            if not edge.active:
+                edge.activate()
+            edge.add_face(self)
     
     @property
     def area(self):
@@ -303,7 +414,7 @@ class Face:
         returns:    (w0, w1, w2) each shape (n,) (or scalars if X is (2,))
         """
 
-        X  = np.asarray(self.mesh.data.iloc[self.mask,[0,1]],  dtype=float)
+        X  = self.mesh.X[self.mask]
         if X.ndim == 1:
             X = X[None, :]  # make (1,2)
 
