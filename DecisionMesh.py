@@ -33,7 +33,7 @@ class DecisionMesh:
     
     def __init__(self, df : pd.DataFrame):
         self.X = df.iloc[:, :2].to_numpy()
-        self.residuals = df.iloc[:,2].to_numpy()
+        self.values = df.iloc[:,2].to_numpy()
         self.index = df.index
         self.root = TreeNode(self)
         self.leaves = set()
@@ -41,11 +41,6 @@ class DecisionMesh:
         self.active_faces = set()
         self.active_vertices = set()
         self.active_edges = set()
-        
-        
-        #dict with vertices as keys and masks as ownership
-        self.ownership = defaultdict(self._empty_mask)
-        self.coefficients = defaultdict(self._empty_coeff)
         self.midpoints = set()
         
         self.create_outer_vertices()
@@ -67,13 +62,13 @@ class DecisionMesh:
     def first_split(self):
         
         self.split_edge = Edge(self, self.outer_vertices['bottom_left'],self.outer_vertices['top_right'], True)
-        self.top_face = Face(self, self.split_edge,self.outer_edges['left'],self.outer_edges['top'], path = '+')
-        self.bottom_face = Face(self, self.split_edge, self.outer_edges['bottom'], self.outer_edges['right'], path = '-')
-        self.root.split(self.split_edge, self.top_face, self.bottom_face)
         mask = (self.X @ self.split_edge.normal) >= self.split_edge.intercept
-        self.top_face.update_mask(mask)
-        self.bottom_face.update_mask(~mask)
-        self.regress_and_assign()
+        self.top_face = Face(self, self.split_edge,self.outer_edges['left'],self.outer_edges['top'], mask, path = '+')
+        self.bottom_face = Face(self, self.split_edge, self.outer_edges['bottom'], self.outer_edges['right'], ~mask, path = '-')
+        self.root.split(self.split_edge, self.top_face, self.bottom_face)
+        
+
+        self.outer_vertices['bottom_left'].regress_and_assign()
         
     def create_outer_vertices(self):
         self.xmin = self.X[:,0].min()
@@ -88,7 +83,6 @@ class DecisionMesh:
         
         for vertex in self.outer_vertices.values():
             self.active_vertices.add(vertex)
-            self.coefficients[vertex]
 
     def create_outer_edges(self):
         self.outer_edges = dict()
@@ -147,23 +141,6 @@ class DecisionMesh:
         ax.set_ylim(self.ymin - 1, self.ymax + 1)
         ax.set_title("Mesh height (linear interpolation)")
         plt.show()
-
-    def regress_and_assign(self, target_col: int = 2):
-        """
-        Ordinary Least Squares with NO intercept.
-        y = X beta, where X's columns are vertex coefficient vectors.
-        Sets vertex.height = beta_j for each vertex column.
-        """
-        # Build dense design matrix (columns are Vertex objects)
-        X_df = pd.DataFrame({v: s for v, s in self.coefficients.items()}, index=self.index).astype(float)
-
-        # Solve OLS
-        X = X_df.to_numpy()
-        beta, *_ = np.linalg.lstsq(X, self.residuals, rcond=None)
-
-        # Assign back to vertices
-        for j, v in enumerate(X_df.columns):
-            v.add_height(float(beta[j]))
 
     
 class Vertex:
@@ -236,11 +213,77 @@ class Vertex:
         self.mesh.active_vertices.add(self)
         if self.parent_edge:
             self.parent_edge.split()
+        self.regress_and_assign()
             
+            
+    def get_ownership(self):
+        """Return union of ownership masks from all incident edges."""
+        if not self.edges:
+            # no edges -> no ownership
+            return pd.Series(False, index=self.mesh.index, dtype=bool)
+        mask = pd.Series(False, index=self.mesh.index, dtype=bool)
+        for e in self.edges:
+            mask |= e.get_ownership()
+        return mask
+
+    
     def regress_and_assign(self):
-        pass
-            
+        # neighborhoods
+        neighborhood = set(self.neighbors); neighborhood.add(self)
+
+        # faces touching self or its neighbors (assume non-empty)
+        def faces_of(v):
+            out = set()
+            for e in v.edges:
+                for s in ('+', '-'):
+                    f = e.faces.get(s)
+                    if f is not None and v in f.vertices:
+                        out.add(f)
+            return out
+        faces = set().union(*(faces_of(v) for v in neighborhood))
+
+        # column order: [neighborhood | distance-2]
+        extended = set().union(*(set(f.vertices) for f in faces))
+        neigh_cols = list(neighborhood)
+        dist2_cols = list(extended - neighborhood)
+
+        # rows covered by these faces (assume non-empty)
+        mask_union = pd.Series(False, index=self.mesh.index, dtype=bool)
+        for f in faces:
+            mask_union |= f.mask
+        rows = mask_union[mask_union].index
+
         
+
+        # Build a stable scalar key map for columns
+        cols = neigh_cols + dist2_cols
+        col_key = {v: id(v) for v in cols}
+        X = pd.DataFrame(0.0, index=rows, columns=[col_key[v] for v in cols])
+
+        # Use the mapped keys when writing/reading
+        for f in faces:
+            W = f.coords
+            W.columns = [col_key[v] for v in f.vertices]
+            
+            X.loc[f.mask[mask_union], [col_key[v] for v in f.vertices]] = W
+
+        v_last = pd.Series({col_key[v]: v.height for v in dist2_cols}, dtype=float)
+        correction = X[[col_key[v] for v in dist2_cols]] @ v_last
+        X_sub = X[[col_key[v] for v in neigh_cols]]
+
+
+        y = pd.Series(self.mesh.values, index=self.mesh.index, dtype=float).loc[rows]
+        y_resid = y - correction
+
+
+        beta, *_ = np.linalg.lstsq(X_sub.to_numpy(), y_resid.to_numpy(), rcond=None)
+
+        # set heights (not incremental)
+        for j, vtx in enumerate(neigh_cols):
+            vtx.height = float(beta[j])
+
+
+    
     @property
     def degree(self) -> int:
         return len(self.edges)
@@ -289,6 +332,9 @@ class Edge:
         self.deactivate()
         self.sub_edges['0'].activate()
         self.sub_edges['1'].activate()
+        
+    def get_ownership(self):
+        return (self.faces['+'].mask | self.faces['-'].mask)
             
     def deactivate(self):
         self.active = False
@@ -297,7 +343,7 @@ class Edge:
         self.vertex1.remove_edge(self)
         self.mesh.midpoints.remove(self.midpoint)
             
-    def test_vertex(self, v: Vertex) -> bool:
+    def test_vertex(self, v: Vertex) -> float:
         return np.array(v) @ self.normal - self.intercept  
         
     def other_vertex(self, v: Vertex) -> Vertex | None:
@@ -323,15 +369,28 @@ class Edge:
         edge0 = face.edges[idx]
         idx = face.vertices.index(self.vertex0)
         edge1 = face.edges[idx]
-        face0 = Face(self.mesh, self.sub_edges[face_type], edge0, self.sub_edges['0'], False)
-        face1 = Face(self.mesh, self.sub_edges[face_type], edge1, self.sub_edges['1'], False)
+        
+        mask = self.mesh.X @ self.sub_edges[face_type].normal >= self.sub_edges[face_type].intercept
+        
         if face_type == '+':
-            face0.path = face.path + '+'
-            face1.path = face.path + '-'
+            mask0 = mask & face.mask
+            mask1 = ~mask & face.mask
+            
+            path0 = face.path + '+'
+            path1 = face.path + '-'
+        else:
+            mask0 = ~mask & face.mask
+            mask1 = mask & face.mask
+            
+            path0 = face.path + '-'
+            path1 = face.path + '+'
+        
+        face0 = Face(self.mesh, self.sub_edges[face_type], edge0, self.sub_edges['0'], mask0, False, path0)
+        face1 = Face(self.mesh, self.sub_edges[face_type], edge1, self.sub_edges['1'], mask1, False, path1)
+        
+        if face_type == '+':
             face.add_sub_division(self, {'e': self.sub_edges[face_type], '+': face0, '-': face1})
         else:
-            face0.path = face.path + '-'
-            face1.path = face.path + '+'
             face.add_sub_division(self, {'e': self.sub_edges[face_type], '+': face1, '-': face0})
     
     def remove_face(self, face):
@@ -340,16 +399,16 @@ class Edge:
         if self.faces['-'] is face:
             self.faces['-'] = None
 class Face:
-    def __init__(self, mesh: DecisionMesh, edge0: 'Edge', edge1: 'Edge', edge2: 'Edge', active: bool = True, path = ''):
+    def __init__(self, mesh: DecisionMesh, edge0: 'Edge', edge1: 'Edge', edge2: 'Edge', mask, active: bool = True, path = ''):
         self.path = path
         self.active = active
         self.mesh = mesh
-        self.node: None
+        self.mask = mask
+        self.node = None
         self.edges = [edge0, edge1, edge2]
         self.sub_divisions = [{'e': None, '+': None, '-': None},
                               {'e': None, '+': None, '-': None},
                               {'e': None, '+': None, '-': None},]
-
         
         vertex1 = self.edges[0].vertex0
         vertex2 = self.edges[0].vertex1
@@ -360,6 +419,8 @@ class Face:
             vertex0 = self.edges[2].other_vertex(vertex1)
 
         self.vertices = [vertex0, vertex1, vertex2] 
+        
+        self.update_coords()
         
         if active:
             self.activate()
@@ -398,29 +459,23 @@ class Face:
         det = (self.vertices[0].x - self.vertices[2].x)*(self.vertices[1].y - self.vertices[0].y) - (self.vertices[0].x-self.vertices[1].x) * (self.vertices[2].y - self.vertices[0].y)
         return 0.5 * np.abs(det)
     
-    def update_mask(self, mask):
-        self.mask = mask
-        
-        for i in range(3):
-            self.mesh.ownership[self.vertices[i]] = self.mesh.ownership[self.vertices[i]] | mask
-            
-        self.update_coords()
+
     
     
     def update_coords(self, eps=1e-14):
         """
-        v0, v1, v2: array-like shape (2,)
-        X:          array-like shape (2,) or (n, 2)
-        returns:    (w0, w1, w2) each shape (n,) (or scalars if X is (2,))
+        Compute barycentric weights for the rows where this face's mask is True.
+        Stores a DataFrame in self.coords with:
+        rows  = dataset index restricted to face.mask
+        cols  = [v0, v1, v2] (the actual Vertex objects)
+        values = [w0, w1, w2]
         """
-
-        X  = self.mesh.X[self.mask]
-        if X.ndim == 1:
-            X = X[None, :]  # make (1,2)
+        rows = self.mesh.index[self.mask]  # pandas Index aligned to dataset
+        X = self.mesh.X[self.mask]         # (n,2) points in this face
 
         a = self.vertices[1] - self.vertices[0]
         b = self.vertices[2] - self.vertices[0]
-        p = X  - self.vertices[0]
+        p = X - self.vertices[0]
 
         d00 = np.dot(a, a)
         d01 = np.dot(a, b)
@@ -429,17 +484,18 @@ class Face:
         d21 = p @ b
 
         denom = d00 * d11 - d01 * d01
-        # handle near-degenerate triangles
         if abs(denom) < eps:
-            # Return NaNs to signal degeneracy
             n = len(X)
-            return (np.full(n, np.nan), np.full(n, np.nan), np.full(n, np.nan))
+            W = np.column_stack([np.full(n, np.nan), np.full(n, np.nan), np.full(n, np.nan)])
+        else:
+            u = (d11 * d20 - d01 * d21) / denom
+            v = (d00 * d21 - d01 * d20) / denom
+            w0 = 1.0 - u - v
+            W = np.column_stack([w0, u, v])
 
-        u = (d11 * d20 - d01 * d21) / denom
-        v = (d00 * d21 - d01 * d20) / denom
-        w = [1.0 - u - v, u, v]
-        for i, vertex in enumerate(self.vertices):
-            self.mesh.coefficients[vertex][self.mask] += w[i]
+        # DataFrame with Vertex-object columns
+        self.coords = pd.DataFrame(W, index=rows, columns=list(self.vertices))
+
     
     def add_sub_division(self, edge: Edge, sub_division: dict):
         idx = self.edges.index(edge)
