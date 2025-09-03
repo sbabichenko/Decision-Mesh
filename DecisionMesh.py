@@ -9,6 +9,20 @@ from matplotlib.patches import Polygon
 from matplotlib.collections import PatchCollection
 
 
+# ---- repr helpers ----
+def _r(x, k=3):
+    try: return f"{float(x):.{k}f}"
+    except Exception: return str(x)
+
+def _rn(arr, k=3):
+    try:
+        a = np.asarray(arr).ravel()
+        return "(" + ",".join(f"{float(t):.{k}f}" for t in a) + ")"
+    except Exception:
+        return str(arr)
+
+
+
 class TreeNode:
     def __init__(self, mesh, parent: 'TreeNode' = None, face: 'Face' = None):
         self.parent = parent
@@ -90,17 +104,13 @@ class DecisionMesh:
         self.outer_edges['bottom'] = Edge(self, self.outer_vertices['bottom_right'],self.outer_vertices['bottom_left'], True)
         self.outer_edges['right'] = Edge(self, self.outer_vertices['top_right'],self.outer_vertices['bottom_right'], True)
         self.outer_edges['top'] = Edge(self, self.outer_vertices['top_right'],self.outer_vertices['top_left'], True)
-        for edge in self.outer_edges.values():
-            self.active_edges.add(edge)
+
     
     def _all_vertices(self):
-        """Return a stable list of unique vertices in this mesh."""
-        # If you later add inner vertices, add them here too.
-        # For now we include the four outer ones (and anything referenced by faces).
-        verts = set(self.outer_vertices.values())
-        for f in [self.top_face, self.bottom_face]:
+        """All unique vertices currently referenced by active faces."""
+        verts = set()
+        for f in list(self.active_faces):
             verts.update(f.vertices)
-        # make order stable
         return list(verts)
 
     def plot_height(self, cmap="viridis", draw_edges=True, draw_vertices=True):
@@ -144,7 +154,10 @@ class DecisionMesh:
 
     
 class Vertex:
+    _seq = 0
+    
     def __init__(self, mesh, x: float, y: float, active = False, parent_edge: 'Edge' = None):
+        self._id = Vertex._seq; Vertex._seq += 1  # << add
         self.x = x
         self.y = y
         self.mesh = mesh
@@ -156,8 +169,18 @@ class Vertex:
         self.edges: set[Edge] = set()
         self.neighbors: set[Vertex] = set()
 
+    @property
+    def sid(self) -> str:
+        return f"V{self._id:03d}"
+
     def __repr__(self):
-        return f"Vertex(x={self.x}, y={self.y})"
+        deg = len(self.edges)
+        parent = getattr(self.parent_edge, "sid", None)
+        return (f"<{self.sid} xy=({_r(self.x)},{_r(self.y)}) "
+                f"h={_r(self.height)} active={self.active} deg={deg} "
+                f"parent={parent}>")
+
+    __str__ = __repr__
 
     # --- arithmetic operations
     def __add__(self, other):
@@ -209,9 +232,11 @@ class Vertex:
         self.height += float(value)
         
     def activate(self):
+        if self.active:
+            return
         self.active = True
         self.mesh.active_vertices.add(self)
-        if self.parent_edge:
+        if self.parent_edge and self.parent_edge.active:
             self.parent_edge.split()
         self.regress_and_assign()
             
@@ -262,10 +287,9 @@ class Vertex:
 
         # Use the mapped keys when writing/reading
         for f in faces:
-            W = f.coords
-            W.columns = [col_key[v] for v in f.vertices]
-            
-            X.loc[f.mask[mask_union], [col_key[v] for v in f.vertices]] = W
+            W = f.coords.copy()
+            W.columns = [col_key[v] for v in f.vertices]  # map Vertex->stable scalar
+            X.loc[W.index, W.columns] = W.values   
 
         v_last = pd.Series({col_key[v]: v.height for v in dist2_cols}, dtype=float)
         correction = X[[col_key[v] for v in dist2_cols]] @ v_last
@@ -290,8 +314,9 @@ class Vertex:
 
 
 class Edge:
+    _seq = 0
     def __init__(self, mesh: DecisionMesh, vertex0: Vertex, vertex1: Vertex, active : bool):
-        self.active = active
+        self._id = Edge._seq; Edge._seq += 1
         self.vertex0 = vertex0
         self.vertex1 = vertex1
         self.mesh = mesh
@@ -309,12 +334,38 @@ class Edge:
 
         # signed line equation: normal · p = intercept
         self.intercept = float(self.normal @ np.array([vertex0.x, vertex0.y], dtype=float))
-
+        self.midpoint = None
+        self.sub_edges = {'0': None, '1':None, '+': None, '-': None}
+        self.active = False
         if active:
             self.activate()
             
+    @property
+    def sid(self) -> str:
+        return f"E{self._id:03d}"
+
+    def __repr__(self):
+        v0 = getattr(self.vertex0, "sid", "V?")
+        v1 = getattr(self.vertex1, "sid", "V?")
+        # show which faces are attached by path (not full repr to avoid recursion)
+        fp = self.faces.get('+'); fm = self.faces.get('-')
+        fp_tag = f"{getattr(fp, 'sid', None)}:{getattr(fp, 'path', None)}" if fp else None
+        fm_tag = f"{getattr(fm, 'sid', None)}:{getattr(fm, 'path', None)}" if fm else None
+        has_mid = hasattr(self, "midpoint")
+        subs = getattr(self, "sub_edges", None)
+        sub_ready = [k for k, v in subs.items()] if isinstance(subs, dict) else []
+        sub_ready = [k for k in ('0','1','+','-') if isinstance(subs, dict) and subs.get(k) is not None]
+
+        return (f"<{self.sid} {v0}->{v1} active={self.active} "
+                f"n={_rn(self.normal)} b={_r(self.intercept)} "
+                f"faces(+={fp_tag},-={fm_tag}) mid={has_mid} sub={sub_ready}>")
+
+    __str__ = __repr__
+
     
     def activate(self):
+        if self.active:
+            return
         self.active = True
         self.mesh.active_edges.add(self)
         self.midpoint = Vertex(self.mesh, (self.vertex0.x + self.vertex1.x)/2, (self.vertex0.y + self.vertex1.y)/2, parent_edge=self)
@@ -328,20 +379,22 @@ class Edge:
             self.faces['+'].split(self)
         if self.faces['-']:
             self.faces['-'].split(self)
-        
-        self.deactivate()
+            
         self.sub_edges['0'].activate()
         self.sub_edges['1'].activate()
+        self.deactivate()
         
-    def get_ownership(self):
-        return (self.faces['+'].mask | self.faces['-'].mask)
+
             
     def deactivate(self):
+        if not self.active:
+            return
         self.active = False
-        self.mesh.active_edges.remove(self)
+        self.mesh.active_edges.discard(self)
         self.vertex0.remove_edge(self)
         self.vertex1.remove_edge(self)
-        self.mesh.midpoints.remove(self.midpoint)
+        if self.midpoint is not None:
+            self.mesh.midpoints.discard(self.midpoint)
             
     def test_vertex(self, v: Vertex) -> float:
         return np.array(v) @ self.normal - self.intercept  
@@ -399,9 +452,12 @@ class Edge:
         if self.faces['-'] is face:
             self.faces['-'] = None
 class Face:
-    def __init__(self, mesh: DecisionMesh, edge0: 'Edge', edge1: 'Edge', edge2: 'Edge', mask, active: bool = True, path = ''):
+    _seq = 0
+
+    def __init__(self, mesh: 'DecisionMesh', edge0: 'Edge', edge1: 'Edge', edge2: 'Edge',
+                 mask, active: bool = True, path=''):
+        self._id = Face._seq; Face._seq += 1  # <-- stable id
         self.path = path
-        self.active = active
         self.mesh = mesh
         self.mask = mask
         self.node = None
@@ -409,21 +465,38 @@ class Face:
         self.sub_divisions = [{'e': None, '+': None, '-': None},
                               {'e': None, '+': None, '-': None},
                               {'e': None, '+': None, '-': None},]
-        
+
         vertex1 = self.edges[0].vertex0
         vertex2 = self.edges[0].vertex1
         vertex0 = self.edges[2].other_vertex(vertex1)
-
         if not vertex0:
             vertex2, vertex1 = vertex1, vertex2
             vertex0 = self.edges[2].other_vertex(vertex1)
-
-        self.vertices = [vertex0, vertex1, vertex2] 
-        
+        self.vertices = [vertex0, vertex1, vertex2]
         self.update_coords()
         
+        self.active = False
         if active:
             self.activate()
+
+    @property
+    def sid(self) -> str:
+        return f"F{self._id:03d}"
+
+    def __repr__(self):
+        vs = ",".join(getattr(v, "sid", "V?") for v in self.vertices)
+        es = ",".join(getattr(e, "sid", "E?") for e in self.edges)
+        try:
+            npts = int(self.mask.sum())
+        except Exception:
+            npts = "?"
+        # show which edges have created sub-divisions
+        split_flags = "".join('1' if sd['e'] is not None else '0' for sd in self.sub_divisions)
+        return (f"<{self.sid} path='{self.path}' active={self.active} "
+                f"verts=[{vs}] edges=[{es}] area={_r(self.area)} n={npts} "
+                f"split={split_flags}>")
+
+    __str__ = __repr__
                 
     def addnode(self, node: TreeNode):
         self.node = node
@@ -440,17 +513,20 @@ class Face:
         sub_division['-'].activate()
         
     def deactivate(self):
+        if not self.active:
+            return
         self.active = False
-        self.mesh.active_faces.remove(self)
+        self.mesh.active_faces.discard(self)
         for edge in self.edges:
             edge.remove_face(self)
             
     def activate(self):
+        if self.active:
+            return
         self.active = True
         self.mesh.active_faces.add(self)
         for edge in self.edges:
-            if not edge.active:
-                edge.activate()
+            edge.activate()
             edge.add_face(self)
     
     @property
