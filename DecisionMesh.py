@@ -238,21 +238,10 @@ class Vertex:
         self.mesh.active_vertices.add(self)
         if self.parent_edge and self.parent_edge.active:
             self.parent_edge.split()
-        self.regress_and_assign()
+        self.regress()
             
             
-    def get_ownership(self):
-        """Return union of ownership masks from all incident edges."""
-        if not self.edges:
-            # no edges -> no ownership
-            return pd.Series(False, index=self.mesh.index, dtype=bool)
-        mask = pd.Series(False, index=self.mesh.index, dtype=bool)
-        for e in self.edges:
-            mask |= e.get_ownership()
-        return mask
-
-    
-    def regress_and_assign(self):
+    def get_extended_faces(self):
         # neighborhoods
         neighborhood = set(self.neighbors); neighborhood.add(self)
 
@@ -269,19 +258,20 @@ class Vertex:
 
         # column order: [neighborhood | distance-2]
         extended = set().union(*(set(f.vertices) for f in faces))
-        neigh_cols = list(neighborhood)
-        dist2_cols = list(extended - neighborhood)
+        return extended, faces
+    
+    def get_simulated_extended_faces(self):
+        pass
+    
+    def build_design_matrix(self, faces):
+        
 
-        # rows covered by these faces (assume non-empty)
         mask_union = pd.Series(False, index=self.mesh.index, dtype=bool)
         for f in faces:
             mask_union |= f.mask
         rows = mask_union[mask_union].index
 
-        
-
-        # Build a stable scalar key map for columns
-        cols = neigh_cols + dist2_cols
+        cols = set().union(*(set(f.vertices) for f in faces))
         col_key = {v: id(v) for v in cols}
         X = pd.DataFrame(0.0, index=rows, columns=[col_key[v] for v in cols])
 
@@ -289,28 +279,67 @@ class Vertex:
         for f in faces:
             W = f.coords.copy()
             W.columns = [col_key[v] for v in f.vertices]  # map Vertex->stable scalar
-            X.loc[W.index, W.columns] = W.values   
+            X.loc[W.index, W.columns] = W.values 
+        
+        return X, rows, col_key
+        
 
-        v_last = pd.Series({col_key[v]: v.height for v in dist2_cols}, dtype=float)
-        correction = X[[col_key[v] for v in dist2_cols]] @ v_last
-        X_sub = X[[col_key[v] for v in neigh_cols]]
+    
+    def regress(self, assign = True, return_details = False):
+        extended, faces = self.get_extended_faces()
+        
+        neighborhood = set(self.neighbors)
+        neighborhood.add(self)
+        distance2 = extended - neighborhood
+        X, rows, col_key = self.build_design_matrix(faces)
 
 
+        v_far = pd.Series({col_key[v]: v.height for v in distance2}, dtype=float)
+        correction = X[[col_key[v] for v in distance2]] @ v_far
+        X_neighborhood = X[[col_key[v] for v in neighborhood]]
+
+        #fix the effect of distant vertices
         y = pd.Series(self.mesh.values, index=self.mesh.index, dtype=float).loc[rows]
         y_resid = y - correction
 
+        #regress only on neighborhood vertices
+        beta, *_ = np.linalg.lstsq(X_neighborhood.to_numpy(), y_resid.to_numpy(), rcond=None)
 
-        beta, *_ = np.linalg.lstsq(X_sub.to_numpy(), y_resid.to_numpy(), rcond=None)
-
-        # set heights (not incremental)
-        for j, vtx in enumerate(neigh_cols):
-            vtx.height = float(beta[j])
+        if assign:
+            # set heights (not incremental)
+            for j, vtx in enumerate(neighborhood):
+                vtx.height = float(beta[j])
+        if return_details:
+            beta_dict = {v: float(beta[j]) for j, v in enumerate(neighborhood)}
+            return beta_dict
 
 
     
     @property
     def degree(self) -> int:
         return len(self.edges)
+    
+    def simulate_activation(self):
+        if not self.parent_edge:
+            return
+        
+        def faces_of(v):
+            out = set()
+            for e in v.edges:
+                for s in ('+', '-'):
+                    f = e.faces.get(s)
+                    if f is not None and v in f.vertices:
+                        out.add(f)
+            return out
+        
+        neighborhood = self.neighbors_after_split()
+        
+        #get all faces touching self or its neighbors
+        faces = set().union(*(faces_of(v) for v in neighborhood))
+        
+        #remove faces on either side of parent edge which would get split
+        faces.discard(self.parent_edge.faces.get('+'))
+        faces.discard(self.parent_edge.faces.get('-'))
 
 
 class Edge:
