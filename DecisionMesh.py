@@ -2,7 +2,7 @@ import pandas as pd
 import numpy as np
 import math
 from collections import defaultdict
-
+import heapq
 import matplotlib.pyplot as plt
 import matplotlib.tri as mtri
 from matplotlib.patches import Polygon
@@ -82,7 +82,29 @@ class DecisionMesh:
         self.root.split(self.split_edge, self.top_face, self.bottom_face)
         
 
-        self.outer_vertices['bottom_left'].regress_and_assign()
+        self.outer_vertices['bottom_left'].regress(assign = True)
+        
+    def activate_best_midpoint(self):
+        best = None
+        best_gain = -float("inf")
+        print(len(self.midpoints))
+        for mid in list(self.midpoints):          # list() so activating later doesn't mutate our iterator
+            if not hasattr(mid, "loss_reduction"):
+                continue
+            # coerce to a scalar in case it's a 1-elem array
+            try:
+                gain = float(np.asarray(mid.loss_reduction).ravel()[0])
+            except:
+                print(mid.loss_reduction)
+            if gain > best_gain:
+                best_gain = gain
+                best = mid
+
+        if best is None:
+            return None, None
+
+        best.activate()
+        return best, best_gain
         
     def create_outer_vertices(self):
         self.xmin = self.X[:,0].min()
@@ -113,7 +135,7 @@ class DecisionMesh:
             verts.update(f.vertices)
         return list(verts)
 
-    def plot_height(self, cmap="viridis", draw_edges=True, draw_vertices=True):
+    def plot_height(self, cmap="viridis", draw_edges= False, draw_vertices= False):
         """
         Color the mesh by linearly interpolated vertex heights using Gouraud shading.
         Assumes each vertex has .height set (e.g., via regress_and_assign()).
@@ -161,12 +183,16 @@ class Vertex:
         self.x = x
         self.y = y
         self.mesh = mesh
+        self.height_dict = dict()
         self.active = active
         
         self.parent_edge = parent_edge
-        self.height = 0.0  # will be set later by regression
+        if parent_edge is not None:
+            self.height = (parent_edge.vertex0.height + parent_edge.vertex1.height) / 2
+        else:
+            self.height = 0.0  # will be set later by regression
         
-        self.edges: set[Edge] = set()
+        self.edges: set['Edge'] = set()
         self.neighbors: set[Vertex] = set()
 
     @property
@@ -238,7 +264,8 @@ class Vertex:
         self.mesh.active_vertices.add(self)
         if self.parent_edge and self.parent_edge.active:
             self.parent_edge.split()
-        self.regress()
+        self.height_dict, self.loss_reduction = self.regress()
+        self.update_heights()
             
             
     def get_extended_faces(self):
@@ -258,10 +285,9 @@ class Vertex:
 
         # column order: [neighborhood | distance-2]
         extended = set().union(*(set(f.vertices) for f in faces))
-        return extended, faces
+        return neighborhood, extended - neighborhood, faces
     
-    def get_simulated_extended_faces(self):
-        pass
+
     
     def build_design_matrix(self, faces):
         
@@ -272,7 +298,7 @@ class Vertex:
         rows = mask_union[mask_union].index
 
         cols = set().union(*(set(f.vertices) for f in faces))
-        col_key = {v: id(v) for v in cols}
+        col_key = {v: v._id for v in cols}
         X = pd.DataFrame(0.0, index=rows, columns=[col_key[v] for v in cols])
 
         # Use the mapped keys when writing/reading
@@ -284,45 +310,84 @@ class Vertex:
         return X, rows, col_key
         
 
+
     
-    def regress(self, assign = True, return_details = False):
-        extended, faces = self.get_extended_faces()
-        
-        neighborhood = set(self.neighbors)
-        neighborhood.add(self)
-        distance2 = extended - neighborhood
+    def regress(self, assign = False, simulate = False):
+        if simulate:
+            neighborhood, distance2, faces = self.get_simulated_faces()
+        else:
+            neighborhood, distance2, faces = self.get_extended_faces()
+        neighborhood = list(neighborhood)
+        distance2 = list(distance2)
         X, rows, col_key = self.build_design_matrix(faces)
 
 
         v_far = pd.Series({col_key[v]: v.height for v in distance2}, dtype=float)
         correction = X[[col_key[v] for v in distance2]] @ v_far
         X_neighborhood = X[[col_key[v] for v in neighborhood]]
-
-        #fix the effect of distant vertices
         y = pd.Series(self.mesh.values, index=self.mesh.index, dtype=float).loc[rows]
+
+
+
+        y_pred_orig = X @ pd.Series({col_key[v]: v.height for v in neighborhood + distance2}, dtype=float)
+        orig_loss = float(np.sum((y - y_pred_orig)**2))
+    
+        
+
         y_resid = y - correction
 
-        #regress only on neighborhood vertices
-        beta, *_ = np.linalg.lstsq(X_neighborhood.to_numpy(), y_resid.to_numpy(), rcond=None)
+        A = X_neighborhood.to_numpy()
+        b = y_resid.to_numpy()
 
-        if assign:
-            # set heights (not incremental)
-            for j, vtx in enumerate(neighborhood):
-                vtx.height = float(beta[j])
-        if return_details:
-            beta_dict = {v: float(beta[j]) for j, v in enumerate(neighborhood)}
-            return beta_dict
+        if A.shape[1] == 0:  # no regressors
+            beta = np.empty((0,), dtype=float)
+            sse_post = float((b**2).sum())
+        else:
+            beta, residuals, _, _ = np.linalg.lstsq(A, b, rcond=None)
+            if residuals.size > 0:           # only when m > n and rank == n
+                sse_post = float(residuals[0])
+            else:                             # fallback: compute SSE explicitly
+                yhat = A @ beta
+                sse_post = float(((b - yhat)**2).sum())
+
+        beta_dict = {v: float(beta[j]) for j, v in enumerate(neighborhood)}
+        loss_reduction = float(orig_loss) - sse_post  # positive = improvement
+        return beta_dict, loss_reduction
+        
 
 
+    def update_heights(self):
+        for v, b in self.height_dict.items():
+            v.height = b
+    
     
     @property
     def degree(self) -> int:
         return len(self.edges)
     
-    def simulate_activation(self):
+    def neighbors_after_split(self):
         if not self.parent_edge:
             return
+        parent_edge = self.parent_edge
+        neighbors = set()
+        neighbors.add(self)
+        neighbors.add(parent_edge.vertex0)
+        neighbors.add(parent_edge.vertex1)
+        if parent_edge.opposing_vertices['+']:
+            neighbors.add(parent_edge.opposing_vertices['+'])
+        if parent_edge.opposing_vertices['-']:
+            neighbors.add(parent_edge.opposing_vertices['-'])
+        return neighbors
         
+    
+    def get_simulated_faces(self):
+        if not self.parent_edge:
+            return
+        parent_edge = self.parent_edge
+        face_plus = parent_edge.faces.get('+')
+        face_minus = parent_edge.faces.get('-')
+        plus_idx = face_plus.vertices.index(parent_edge.vertex1) if face_plus else None
+        minus_idx = face_minus.vertices.index(parent_edge.vertex1) if face_minus else None
         def faces_of(v):
             out = set()
             for e in v.edges:
@@ -336,10 +401,20 @@ class Vertex:
         
         #get all faces touching self or its neighbors
         faces = set().union(*(faces_of(v) for v in neighborhood))
-        
-        #remove faces on either side of parent edge which would get split
+        if face_plus is not None:
+            idx = face_plus.edges.index(parent_edge)
+            faces.add(face_plus.sub_divisions[idx].get('+'))
+            faces.add(face_plus.sub_divisions[idx].get('-'))
+        if face_minus is not None:
+            idx = face_minus.edges.index(parent_edge)
+            faces.add(face_minus.sub_divisions[idx].get('+'))
+            faces.add(face_minus.sub_divisions[idx].get('-'))
         faces.discard(self.parent_edge.faces.get('+'))
         faces.discard(self.parent_edge.faces.get('-'))
+        
+        
+        extended = set().union(*(set(f.vertices) for f in faces))
+        return neighborhood, extended - neighborhood, faces
 
 
 class Edge:
@@ -397,12 +472,19 @@ class Edge:
             return
         self.active = True
         self.mesh.active_edges.add(self)
-        self.midpoint = Vertex(self.mesh, (self.vertex0.x + self.vertex1.x)/2, (self.vertex0.y + self.vertex1.y)/2, parent_edge=self)
-        self.mesh.midpoints.add(self.midpoint)
+        self.add_midpoint()
         self.vertex0.add_edge(self)
         self.vertex1.add_edge(self)
         self.sub_edges = {'0': Edge(self.mesh, self.vertex0, self.midpoint, False), '1': Edge(self.mesh, self.midpoint, self.vertex1, False),'+': None, '-': None}
-            
+          
+    
+    def add_midpoint(self):
+        if self.midpoint is not None:
+            return
+        self.midpoint = Vertex(self.mesh, (self.vertex0.x + self.vertex1.x)/2, (self.vertex0.y + self.vertex1.y)/2, parent_edge=self)
+        self.mesh.midpoints.add(self.midpoint)
+
+        
     def split(self):
         if self.faces['+']:
             self.faces['+'].split(self)
@@ -474,6 +556,12 @@ class Edge:
             face.add_sub_division(self, {'e': self.sub_edges[face_type], '+': face0, '-': face1})
         else:
             face.add_sub_division(self, {'e': self.sub_edges[face_type], '+': face1, '-': face0})
+            
+        
+
+        h, loss = self.midpoint.regress(simulate=True, assign=False)
+        self.midpoint.height_dict = h
+        self.midpoint.loss_reduction = loss
     
     def remove_face(self, face):
         if self.faces['+'] is face:
