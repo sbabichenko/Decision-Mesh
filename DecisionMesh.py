@@ -53,17 +53,21 @@ class DecisionMesh:
         self.leaves = set()
         self.leaves.add(self.root)
         self.active_faces = set()
-        self.active_vertices = set()
+        self.vertices = set()
         self.active_edges = set()
         self.midpoints = set()
         
         self.create_outer_vertices()
         self.create_outer_edges()
         
+        self.split_edge = Edge(self, self.outer_vertices['bottom_left'],self.outer_vertices['top_right'], True)
+        mask = (self.X @ self.split_edge.normal) >= self.split_edge.intercept
+        self.top_face = Face(self, self.split_edge,self.outer_edges['left'],self.outer_edges['top'], mask, path = '+')
+        self.bottom_face = Face(self, self.split_edge, self.outer_edges['bottom'], self.outer_edges['right'], ~mask, path = '-')
+        self.root.split(self.split_edge, self.top_face, self.bottom_face)
         
-        
-
-        self.first_split()
+        for v in list(self.vertices):
+            v.update_info()
     
     def _empty_mask(self) -> pd.Series:
         """Default factory for ownership: a fresh all-False mask aligned to data."""
@@ -73,21 +77,11 @@ class DecisionMesh:
         """All-zero coefficients aligned to dataset index."""
         return pd.Series(0.0, index=self.index, dtype=float)
     
-    def first_split(self):
-        
-        self.split_edge = Edge(self, self.outer_vertices['bottom_left'],self.outer_vertices['top_right'], True)
-        mask = (self.X @ self.split_edge.normal) >= self.split_edge.intercept
-        self.top_face = Face(self, self.split_edge,self.outer_edges['left'],self.outer_edges['top'], mask, path = '+')
-        self.bottom_face = Face(self, self.split_edge, self.outer_edges['bottom'], self.outer_edges['right'], ~mask, path = '-')
-        self.root.split(self.split_edge, self.top_face, self.bottom_face)
-        
 
-        self.outer_vertices['bottom_left'].regress(assign = True)
         
     def activate_best_midpoint(self):
         best = None
         best_gain = -float("inf")
-        print(len(self.midpoints))
         for mid in list(self.midpoints):          # list() so activating later doesn't mutate our iterator
             if not hasattr(mid, "loss_reduction"):
                 continue
@@ -105,6 +99,25 @@ class DecisionMesh:
 
         best.activate()
         return best, best_gain
+    
+    def update_best_vertex(self):
+        best = None
+        best_gain = -float("inf")
+        for mid in list(self.vertices):          # list() so activating later doesn't mutate our iterator
+            if mid.loss_reduction > best_gain:
+                best = mid
+                best_gain = mid.loss_reduction
+        if best is None:
+            print('no best')
+            return None, None
+
+        # print(f'best vertex:{best}, old height {best.height}, new height {best.new_height}, loss reduction {best.loss_reduction}')
+        if best.active:
+            best.update_height()
+        else:
+            best.activate()
+        
+        return best, best_gain
         
     def create_outer_vertices(self):
         self.xmin = self.X[:,0].min()
@@ -117,15 +130,13 @@ class DecisionMesh:
         self.outer_vertices['bottom_right'] = Vertex(self, self.xmax,self.ymin, True)
         self.outer_vertices['top_right'] = Vertex(self, self.xmax,self.ymax, True)
         
-        for vertex in self.outer_vertices.values():
-            self.active_vertices.add(vertex)
 
     def create_outer_edges(self):
         self.outer_edges = dict()
-        self.outer_edges['left'] = Edge(self, self.outer_vertices['top_left'],self.outer_vertices['bottom_left'], True)
-        self.outer_edges['bottom'] = Edge(self, self.outer_vertices['bottom_right'],self.outer_vertices['bottom_left'], True)
-        self.outer_edges['right'] = Edge(self, self.outer_vertices['top_right'],self.outer_vertices['bottom_right'], True)
-        self.outer_edges['top'] = Edge(self, self.outer_vertices['top_right'],self.outer_vertices['top_left'], True)
+        self.outer_edges['left'] = Edge(self, self.outer_vertices['top_left'],self.outer_vertices['bottom_left'], False)
+        self.outer_edges['bottom'] = Edge(self, self.outer_vertices['bottom_right'],self.outer_vertices['bottom_left'], False)
+        self.outer_edges['right'] = Edge(self, self.outer_vertices['top_right'],self.outer_vertices['bottom_right'], False)
+        self.outer_edges['top'] = Edge(self, self.outer_vertices['top_right'],self.outer_vertices['top_left'], False)
 
     
     def _all_vertices(self):
@@ -140,7 +151,7 @@ class DecisionMesh:
         Color the mesh by linearly interpolated vertex heights using Gouraud shading.
         Assumes each vertex has .height set (e.g., via regress_and_assign()).
         """
-        verts = self.active_vertices
+        verts = self.vertices
         idx = {v: i for i, v in enumerate(verts)}
         xs  = [v.x for v in verts]
         ys  = [v.y for v in verts]
@@ -176,24 +187,46 @@ class DecisionMesh:
 
     
 class Vertex:
+    """
+    A vertex should contain the following information:
+    
+    Its location
+    Its parent edge, if such edge exists
+    If it is active or not
+    height
+    -method
+    -returns average of parent edge vertex heights if inactive
+    -returns set height if active
+    affected_vertices
+    -method
+    -which other vertices will have their regression values/loss change if this vertex gets activated (if inactive) or changes height
+    -equal to neighbors of vertex if active and neighbors if split if inactive
+    edges attached
+    -empty set if inactive
+    
+
+    
+    """
     _seq = 0
     
-    def __init__(self, mesh, x: float, y: float, active = False, parent_edge: 'Edge' = None):
+    def __init__(self, mesh: DecisionMesh, x: float, y: float, active = False, parent_edge: 'Edge' = None, real_vertex = True):
         self._id = Vertex._seq; Vertex._seq += 1  # << add
         self.x = x
         self.y = y
         self.mesh = mesh
-        self.height_dict = dict()
-        self.active = active
         
+        if real_vertex:
+            mesh.vertices.add(self)
+        self.active = active
+        self.to_update = set()
         self.parent_edge = parent_edge
         if parent_edge is not None:
             self.height = (parent_edge.vertex0.height + parent_edge.vertex1.height) / 2
         else:
             self.height = 0.0  # will be set later by regression
-        
         self.edges: set['Edge'] = set()
         self.neighbors: set[Vertex] = set()
+        
 
     @property
     def sid(self) -> str:
@@ -210,15 +243,15 @@ class Vertex:
 
     # --- arithmetic operations
     def __add__(self, other):
-        return Vertex(self.mesh, self.x + other.x, self.y + other.y)
+        return Vertex(self.mesh, self.x + other.x, self.y + other.y, real_vertex = False)
 
     def __sub__(self, other):
-        return Vertex(self.mesh, self.x - other.x, self.y - other.y)
+        return Vertex(self.mesh, self.x - other.x, self.y - other.y, real_vertex = False)
 
     def __mul__(self, s: float):  
-        return Vertex(self.mesh, self.x * s, self.y * s)
+        return Vertex(self.mesh, self.x * s, self.y * s, real_vertex = False)
     
-    def __truediv__(self, s: float): return Vertex(self.mesh, self.x / s, self.y / s)
+    def __truediv__(self, s: float): return Vertex(self.mesh, self.x / s, self.y / s, real_vertex = False)
     
 
     def __iter__(self):
@@ -254,20 +287,58 @@ class Vertex:
         if other in self.neighbors:
             self.neighbors.remove(other)
     
-    def add_height(self, value: float):
-        self.height += float(value)
-        
+
+      
     def activate(self):
+        """
+        sets active to true                                            1
+        updates height to locally optimal value                        2
+        tells the parent edge to split                                 3
+            parent edge tells adjacent faces to split using that edge  4
+                faces tell edges to remove the face                    5
+                faces tell subfaces to activate                        6
+                    subfaces tell edges to create subsubfaces for it   7
+                    subfaces tell their edges to activate if inactive  8
+                        edges tell adjacent vertices to add the edge   9
+                        edges create a midpoint                       10
+                        midpoints update info                         11
+            parent edge removes itself from adjacent vertices         12        
+            parent edge tells subedges to activate                    13
+                edges tell adjacent vertices to add the edge          14
+                edges create a midpoint                               15
+                    midpoint runs loc_regress                         16
+        tells affected_vertices to run loc_regress                    17
+        sets loss_reduction to 0                                      18
+    
+        checks:
+        1: if self.active: return  #do nothing if midpoint is already active
+        2: check that locally optimal value exists, otherwise raise error
+        3: check if parent_edge exists, otherwise raise error
+        4: check that at least one adjacent face exists, otherwise raise error
+        5: check if face is known to edge, otherwise raise error
+        6: check if subface exists, otherwise raise error
+       12: check if edge is known to vertices, otherwise raise error
+       13: check if two such subedges exist, otherwise raise error
+                
+        """
         if self.active:
             return
         self.active = True
-        self.mesh.active_vertices.add(self)
-        if self.parent_edge and self.parent_edge.active:
-            self.parent_edge.split()
-        self.height_dict, self.loss_reduction = self.regress()
-        self.update_heights()
+        self.height = self.new_height
+        self.parent_edge.split()
+        for v in self.affected_vertices:
+            v.update_info()
+        self.loss_reduction = 0
             
-            
+    def update_info(self):
+        self.new_height, self.loss_reduction, self.affected_vertices = self.loc_regress()
+        
+    def update_height(self):
+        self.height = self.new_height
+        for v in self.affected_vertices:
+            v.update_info()
+        self.loss_reduction = 0
+        
     def get_extended_faces(self):
         # neighborhoods
         neighborhood = set(self.neighbors); neighborhood.add(self)
@@ -287,7 +358,15 @@ class Vertex:
         extended = set().union(*(set(f.vertices) for f in faces))
         return neighborhood, extended - neighborhood, faces
     
-
+    def get_faces(self):
+        faces = set()
+        for e in self.edges:
+            for s in ('+','-'):
+                f = e.faces.get(s)
+                if f is not None and self in f.vertices:
+                    faces.add(f)
+        neighbors = {v for f in faces for v in f.vertices if v is not self}
+        return neighbors, faces
     
     def build_design_matrix(self, faces):
         
@@ -312,53 +391,70 @@ class Vertex:
 
 
     
-    def regress(self, assign = False, simulate = False):
-        if simulate:
-            neighborhood, distance2, faces = self.get_simulated_faces()
-        else:
-            neighborhood, distance2, faces = self.get_extended_faces()
-        neighborhood = list(neighborhood)
-        distance2 = list(distance2)
-        X, rows, col_key = self.build_design_matrix(faces)
 
-
-        v_far = pd.Series({col_key[v]: v.height for v in distance2}, dtype=float)
-        correction = X[[col_key[v] for v in distance2]] @ v_far
-        X_neighborhood = X[[col_key[v] for v in neighborhood]]
-        y = pd.Series(self.mesh.values, index=self.mesh.index, dtype=float).loc[rows]
-
-
-
-        y_pred_orig = X @ pd.Series({col_key[v]: v.height for v in neighborhood + distance2}, dtype=float)
-        orig_loss = float(np.sum((y - y_pred_orig)**2))
     
-        
-
-        y_resid = y - correction
-
-        A = X_neighborhood.to_numpy()
-        b = y_resid.to_numpy()
-
-        if A.shape[1] == 0:  # no regressors
-            beta = np.empty((0,), dtype=float)
-            sse_post = float((b**2).sum())
+    def loc_regress(self):
+        # 1) which faces / neighbors?
+        if self.active:
+            neighbors, faces = self.get_faces()
         else:
-            beta, residuals, _, _ = np.linalg.lstsq(A, b, rcond=None)
-            if residuals.size > 0:           # only when m > n and rank == n
-                sse_post = float(residuals[0])
-            else:                             # fallback: compute SSE explicitly
-                yhat = A @ beta
-                sse_post = float(((b - yhat)**2).sum())
+            neighbors, faces = self.get_sim_faces()
+            
 
-        beta_dict = {v: float(beta[j]) for j, v in enumerate(neighborhood)}
-        loss_reduction = float(orig_loss) - sse_post  # positive = improvement
-        return beta_dict, loss_reduction
+        if not faces:
+            self.mesh.bad_vertex = self
+            print('vertex',self,'regressed without being attached to faces')
+            print('real', self.real_vertex)
+            return {self: float(self.height)}, 0.0, neighbors
+
+
+
+        # 2) design matrix for those faces
+        X, rows, col_key = self.build_design_matrix(faces)
+        y = pd.Series(self.mesh.values, index=self.mesh.index, dtype=float).loc[rows].to_numpy()
+
+        # 3) fixed contribution from neighbors ("correction")
+        other_cols = [col_key[v] for v in neighbors if v in col_key]
+        if other_cols:
+            other_heights = np.array([v.height for v in neighbors], dtype=float)
+            correction = X[other_cols].to_numpy() @ other_heights
+        else:
+            correction = np.zeros_like(y)
+
+        # 4) column for self (the only regressor)
+        x = X[col_key[self]].to_numpy().astype(float)
+
+        # 5) residual after removing neighbors
+        r = y - correction
+
+        # 6) original loss with current self.height
+        beta_orig = float(self.height)
+        orig_loss = float(((r - x * beta_orig) ** 2).sum())
+
+        # 7) optimal 1D least-squares for beta (self only)
+        xTx = float(x @ x)
+        if xTx > 0.0:
+            xTr = float(x @ r)
+            beta_opt = xTr / xTx
+            # SSE_post = ||r - x*beta_opt||^2 = r^Tr - (x^Tr)^2 / (x^Tx)
+            sse_post = float((r @ r) - (xTr * xTr) / xTx)
+        else:
+            # self's column has no support; nothing to fit
+            beta_opt = beta_orig
+            sse_post = float(r @ r)
+
+        loss_reduction = orig_loss - sse_post
+
+        return float(beta_opt), float(loss_reduction), neighbors
+
         
 
 
     def update_heights(self):
         for v, b in self.height_dict.items():
             v.height = b
+        for v in self.to_update:
+            v.loc_regress()
     
     
     @property
@@ -386,8 +482,6 @@ class Vertex:
         parent_edge = self.parent_edge
         face_plus = parent_edge.faces.get('+')
         face_minus = parent_edge.faces.get('-')
-        plus_idx = face_plus.vertices.index(parent_edge.vertex1) if face_plus else None
-        minus_idx = face_minus.vertices.index(parent_edge.vertex1) if face_minus else None
         def faces_of(v):
             out = set()
             for e in v.edges:
@@ -416,8 +510,35 @@ class Vertex:
         extended = set().union(*(set(f.vertices) for f in faces))
         return neighborhood, extended - neighborhood, faces
 
+    def get_sim_faces(self):
+        if not self.parent_edge:
+            return
+        
+        faces = set()
+        parent_edge = self.parent_edge
+        face_plus = parent_edge.faces.get('+')
+        face_minus = parent_edge.faces.get('-')
+        if face_plus is not None:
+            idx = face_plus.edges.index(parent_edge)
+            faces.add(face_plus.sub_divisions[idx].get('+'))
+            faces.add(face_plus.sub_divisions[idx].get('-'))
+        if face_minus is not None:
+            idx = face_minus.edges.index(parent_edge)
+            faces.add(face_minus.sub_divisions[idx].get('+'))
+            faces.add(face_minus.sub_divisions[idx].get('-'))
+        
+        neighbors = {v for f in faces for v in f.vertices if v is not self}
+        return neighbors, faces
 
 class Edge:
+    """
+    Edges should have the following information:
+    
+    vertices at each end
+    a test (test_vertex) to check which side of the edge a point lies on
+    the faces attached to the edge (+ and/or -)
+    activity of the edge
+    """
     _seq = 0
     def __init__(self, mesh: DecisionMesh, vertex0: Vertex, vertex1: Vertex, active : bool):
         self._id = Edge._seq; Edge._seq += 1
@@ -482,7 +603,6 @@ class Edge:
         if self.midpoint is not None:
             return
         self.midpoint = Vertex(self.mesh, (self.vertex0.x + self.vertex1.x)/2, (self.vertex0.y + self.vertex1.y)/2, parent_edge=self)
-        self.mesh.midpoints.add(self.midpoint)
 
         
     def split(self):
@@ -559,9 +679,7 @@ class Edge:
             
         
 
-        h, loss = self.midpoint.regress(simulate=True, assign=False)
-        self.midpoint.height_dict = h
-        self.midpoint.loss_reduction = loss
+        self.midpoint.update_info()
     
     def remove_face(self, face):
         if self.faces['+'] is face:
@@ -569,6 +687,15 @@ class Edge:
         if self.faces['-'] is face:
             self.faces['-'] = None
 class Face:
+    """
+    Faces should carry the bulk of information
+    
+    They should contain:
+    -a mask of points in the face (change later to set of indices)
+    -the edges attached to the face
+    -the vertices attached to the face
+    - the coordinates of each point in the face
+    """
     _seq = 0
 
     def __init__(self, mesh: 'DecisionMesh', edge0: 'Edge', edge1: 'Edge', edge2: 'Edge',
