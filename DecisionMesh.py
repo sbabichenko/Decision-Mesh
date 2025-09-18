@@ -2,7 +2,7 @@ import pandas as pd
 import numpy as np
 import math
 from collections import defaultdict
-import heapq
+from heapdict import heapdict
 import matplotlib.pyplot as plt
 import matplotlib.tri as mtri
 from matplotlib.patches import Polygon
@@ -24,28 +24,121 @@ def _rn(arr, k=3):
 
 
 class TreeNode:
+    _seq = 0
+
     def __init__(self, mesh, parent: 'TreeNode' = None, face: 'Face' = None):
+        self._id = TreeNode._seq; TreeNode._seq += 1
         self.parent = parent
         self.split_criterion = None
         self.face = face
         self.mesh = mesh
+        # children (set after split)
+        self.p: 'TreeNode | None' = None  # '+' child
+        self.m: 'TreeNode | None' = None  # '-' child
         if face:
             self.face.addnode(self)
-    
 
-    def is_leaf(self):
+    # ---------- ids & basic predicates ----------
+    @property
+    def sid(self) -> str:
+        return f"N{self._id:03d}"
+
+    def is_leaf(self) -> bool:
         return self.split_criterion is None
-    
+
+    # ---------- structure helpers ----------
+    def children(self) -> dict[str, 'TreeNode']:
+        out = {}
+        if self.p is not None: out['+'] = self.p
+        if self.m is not None: out['-'] = self.m
+        return out
+
+    @property
+    def depth(self) -> int:
+        d, cur = 0, self.parent
+        while cur is not None:
+            d += 1
+            cur = cur.parent
+        return d
+
+    @property
+    def path(self) -> str:
+        """String of '+'/'-' from root to this node."""
+        bits = []
+        node = self
+        while node.parent is not None:
+            bits.append('+' if node.parent.p is node else '-')
+            node = node.parent
+        return ''.join(reversed(bits))
+
+    # ---------- tree ops ----------
     def split(self, edge: 'Edge', plus: 'Face', minus: 'Face'):
         self.split_criterion = {'normal': edge.normal, 'intercept': edge.intercept}
-        self.children = {'+': TreeNode(self.mesh, self, plus), '-': TreeNode(self.mesh, self, minus)}
+        self.p = TreeNode(self.mesh, self, plus)
+        self.m = TreeNode(self.mesh, self, minus)
+        # maintain leaf set
         self.mesh.leaves.remove(self)
-        self.mesh.leaves.add(self.children['+'])
-        self.mesh.leaves.add(self.children['-'])
+        self.mesh.leaves.add(self.p)
+        self.mesh.leaves.add(self.m)
+
+    # ---------- navigation ----------
+    def child_for(self, sign: str) -> 'TreeNode | None':
+        if sign == '+': return self.p
+        if sign == '-': return self.m
+        raise ValueError("child_for(sign): sign must be '+' or '-'")
+
+    def follow(self, path, *, strict: bool = True, default=None) -> 'TreeNode | None':
+        """
+        Follow a path like '+-++---' (or any iterable of '+'/'-') from this node.
+        If strict=True, raise on errors; else return `default`.
+        """
+        # Accept strings or any iterable of chars
+        steps = path if isinstance(path, str) else list(path)
+
+        # Validate characters once up front
+        bad = [c for c in steps if c not in ('+', '-')]
+        if bad:
+            if strict:
+                raise ValueError(f"Invalid step(s) in path: {bad!r}")
+            return default
+
+        node = self
+        for i, ch in enumerate(steps):
+            if node.is_leaf():
+                if strict:
+                    raise ValueError(f"Stopped at depth {node.depth} ({node.sid} is a leaf); remaining='{''.join(steps[i:])}'")
+                return default
+            nxt = node.child_for(ch)
+            if nxt is None:
+                if strict:
+                    raise KeyError(f"No child '{ch}' from {node.sid} at step {i}")
+                return default
+            node = nxt
+        return node
+
+    def __getitem__(self, path: str) -> 'TreeNode':
+        return self.follow(path, strict=True)
+
+    # ---------- repr ----------
+    def __repr__(self):
+        if self.is_leaf():
+            face_str = getattr(self.face, "sid", None)
+            return f"<{self.sid} Leaf depth={self.depth} path='{self.path}' face={face_str}>"
+
+        sc = self.split_criterion or {}
+        n = _rn(sc.get("normal", "?"))
+        b = _r(sc.get("intercept", "?"))
+        kids = ''.join(sorted(self.children().keys())) or "-"
+        return (f"<{self.sid} Split depth={self.depth} path='{self.path}' "
+                f"n={n} b={b} kids={kids}>")
+
+    __str__ = __repr__
+        
 class DecisionMesh:
     
     
     def __init__(self, df : pd.DataFrame):
+        self.max_aspect_ratio = 5
         self.X = df.iloc[:, :2].to_numpy()
         self.values = df.iloc[:,2].to_numpy()
         self.index = df.index
@@ -56,6 +149,7 @@ class DecisionMesh:
         self.vertices = set()
         self.active_edges = set()
         self.midpoints = set()
+        self.loss_heap = heapdict()
         
         self.create_outer_vertices()
         self.create_outer_edges()
@@ -68,6 +162,9 @@ class DecisionMesh:
         
         for v in list(self.vertices):
             v.update_info()
+            
+
+ 
     
     def _empty_mask(self) -> pd.Series:
         """Default factory for ownership: a fresh all-False mask aligned to data."""
@@ -78,46 +175,137 @@ class DecisionMesh:
         return pd.Series(0.0, index=self.index, dtype=float)
     
 
-        
-    def activate_best_midpoint(self):
-        best = None
-        best_gain = -float("inf")
-        for mid in list(self.midpoints):          # list() so activating later doesn't mutate our iterator
-            if not hasattr(mid, "loss_reduction"):
-                continue
-            # coerce to a scalar in case it's a 1-elem array
-            try:
-                gain = float(np.asarray(mid.loss_reduction).ravel()[0])
-            except:
-                print(mid.loss_reduction)
-            if gain > best_gain:
-                best_gain = gain
-                best = mid
 
-        if best is None:
-            return None, None
+    def _faces_and_weights(self, eps: float = 1e-12):
+        """
+        Active faces only. Returns (faces, weights) where
+        weights = area(face) * number_of_points(face).
 
-        best.activate()
-        return best, best_gain
+        - Filters to finite, nonnegative areas.
+        - Clips tiny positive areas up to eps to give them some mass.
+        """
+        faces = list(self.active_faces)
+        if not faces:
+            return [], np.array([], dtype=float)
+
+        areas = np.array([float(getattr(f, "area", 0.0)) for f in faces], dtype=float)
+        # count points in each face via mask
+        counts = np.array([int(getattr(f, "mask", None).sum()) if getattr(f, "mask", None) is not None else 0
+                           for f in faces], dtype=float)
+
+        mask = np.isfinite(areas) & (areas >= 0.0)
+        faces  = [f for f, keep in zip(faces, mask) if keep]
+        areas  = areas[mask]
+        counts = counts[mask]
+
+        if areas.size == 0:
+            return [], np.array([], dtype=float)
+
+        tiny = (areas > 0) & (areas < eps)
+        if np.any(tiny):
+            areas = areas.copy()
+            areas[tiny] = eps
+
+        weights = areas * counts  # <-- key change
+        return faces, weights
+
+    def random_face(self, rng=None):
+        """
+        Return a single active Face, sampled with probability ∝ (area × #points).
+        Falls back to uniform if all weights are zero.
+        """
+        faces, weights = self._faces_and_weights()
+        if not faces:
+            raise RuntimeError("No active faces available to sample from.")
+
+        total = float(weights.sum())
+        if total > 0.0:
+            p = weights / total
+        else:
+            p = np.full(len(faces), 1.0 / len(faces), dtype=float)
+
+        if not isinstance(rng, np.random.Generator):
+            rng = np.random.default_rng(rng)
+
+        idx = int(rng.choice(len(faces), p=p, replace=True))
+        return faces[idx]
+      
+
     
-    def update_best_vertex(self):
+    def find_best_vertex(self, random: float = 0.05, rng=None):
+        """
+        With prob `random`, explore:
+        - pick a face via self.random_face() (∝ area × #points),
+        - pick its longest edge (ties random, using .length),
+        - return that edge's existing midpoint.
+
+        Otherwise, exploit: return the vertex with max loss_reduction.
+        """
+        if not isinstance(rng, np.random.Generator):
+            rng = np.random.default_rng(rng)
+
+        # --- exploration: use midpoint of longest edge in a weighted-random face
+        if random > 0.0 and rng.random() < random:
+            face = self.random_face(rng=rng)
+
+            # pick longest edge by .length (tie-break randomly)
+            lengths = [float(e.length) for e in face.edges]
+            max_len = max(lengths)
+            tol = 1e-12
+            candidates = [e for e, L in zip(face.edges, lengths) if abs(L - max_len) <= tol]
+            edge = rng.choice(candidates)
+
+            mid = edge.midpoint  # assumed to exist
+            if mid is None:
+                raise RuntimeError("Expected midpoint to exist on the chosen edge.")
+            if not hasattr(mid, "loss_reduction"):
+                mid.update_info()
+            return mid, float(getattr(mid, "loss_reduction", 0.0))
+
+        # --- exploitation: best current vertex
         best = None
         best_gain = -float("inf")
-        for mid in list(self.vertices):          # list() so activating later doesn't mutate our iterator
-            if mid.loss_reduction > best_gain:
-                best = mid
-                best_gain = mid.loss_reduction
+        for v in list(self.vertices):
+            gain = float(getattr(v, "loss_reduction", -float("inf")))
+            if gain > best_gain:
+                best = v
+                best_gain = gain
+
         if best is None:
             print('no best')
             return None, None
 
-        # print(f'best vertex:{best}, old height {best.height}, new height {best.new_height}, loss reduction {best.loss_reduction}')
+        return best, best_gain
+
+
+
+
+    def update_best_vertex(self, random = 0, rng = None):
+        
+        if not isinstance(rng, np.random.Generator):
+            rng = np.random.default_rng(rng)
+
+        # --- exploration: use midpoint of longest edge in a weighted-random face
+        if random > 0.0 and rng.random() < random:
+            face = self.random_face(rng=rng)
+
+            # pick longest edge by .length (tie-break randomly)
+            lengths = [float(e.length) for e in face.edges]
+            max_len = max(lengths)
+            tol = 1e-12
+            candidates = [e for e, L in zip(face.edges, lengths) if abs(L - max_len) <= tol]
+            edge = rng.choice(candidates)
+
+            best = edge.midpoint
+        else:
+            best, _ = self.loss_heap.peekitem()
+            
+        
+        
         if best.active:
             best.update_height()
         else:
             best.activate()
-        
-        return best, best_gain
         
     def create_outer_vertices(self):
         self.xmin = self.X[:,0].min()
@@ -146,16 +334,33 @@ class DecisionMesh:
             verts.update(f.vertices)
         return list(verts)
 
-    def plot_height(self, cmap="viridis", draw_edges= False, draw_vertices= False):
+    def plot_height(
+        self, 
+        cmap="viridis", 
+        draw_edges=False, 
+        draw_vertices=False, 
+        vmax_abs=None
+    ):
         """
         Color the mesh by linearly interpolated vertex heights using Gouraud shading.
         Assumes each vertex has .height set (e.g., via regress_and_assign()).
+
+        Parameters
+        ----------
+        cmap : str
+            Colormap to use.
+        draw_edges : bool
+            Whether to overlay mesh edges.
+        draw_vertices : bool
+            Whether to scatter plot vertices.
+        vmax_abs : float or None
+            If provided, the colorscale is symmetric from -vmax_abs to +vmax_abs.
         """
         verts = self.vertices
         idx = {v: i for i, v in enumerate(verts)}
         xs  = [v.x for v in verts]
         ys  = [v.y for v in verts]
-        zs  = [getattr(v, "height", 0.0) for v in verts]  # per-vertex heights
+        zs  = [getattr(v, "height", 0.0) for v in verts]
 
         # Triangles from faces
         tris = []
@@ -165,12 +370,18 @@ class DecisionMesh:
 
         tri = mtri.Triangulation(xs, ys, triangles=tris)
 
+        # Set symmetric color limits if requested
+        if vmax_abs is not None:
+            vmin, vmax = -vmax_abs, vmax_abs
+        else:
+            vmin, vmax = None, None
+
         fig, ax = plt.subplots()
-        tpc = ax.tripcolor(tri, zs, shading="gouraud", cmap=cmap)
+        tpc = ax.tripcolor(tri, zs, shading="gouraud", cmap=cmap,
+                        vmin=vmin, vmax=vmax)
         cbar = fig.colorbar(tpc, ax=ax, label="Height")
 
         if draw_edges:
-            # overlay edges for crisp boundaries
             for edge in list(self.active_edges):
                 ax.plot([edge.vertex0.x, edge.vertex1.x],
                         [edge.vertex0.y, edge.vertex1.y],
@@ -184,6 +395,7 @@ class DecisionMesh:
         ax.set_ylim(self.ymin - 1, self.ymax + 1)
         ax.set_title("Mesh height (linear interpolation)")
         plt.show()
+
 
     
 class Vertex:
@@ -218,6 +430,7 @@ class Vertex:
         if real_vertex:
             mesh.vertices.add(self)
         self.active = active
+        self.disqualified = False
         self.to_update = set()
         self.parent_edge = parent_edge
         if parent_edge is not None:
@@ -329,15 +542,19 @@ class Vertex:
         for v in self.affected_vertices:
             v.update_info()
         self.loss_reduction = 0
+        self.mesh.loss_heap[self] = 0
             
     def update_info(self):
-        self.new_height, self.loss_reduction, self.affected_vertices = self.loc_regress()
+        self.new_height, self.loss_reduction, self.affected_vertices, self.affected_points = self.loc_regress()
+        if not self.disqualified:
+            self.mesh.loss_heap[self] = -self.loss_reduction
         
     def update_height(self):
         self.height = self.new_height
         for v in self.affected_vertices:
             v.update_info()
         self.loss_reduction = 0
+        self.mesh.loss_heap[self] = 0
         
     def get_extended_faces(self):
         # neighborhoods
@@ -394,6 +611,15 @@ class Vertex:
 
     
     def loc_regress(self):
+        """
+        Fit this vertex’s optimal height given neighbors fixed.
+        
+        - Collect faces touching this vertex (or simulated if inactive).
+        - Build design matrix from barycentric weights.
+        - Subtract fixed contribution of neighbors.
+        - Solve 1D least-squares for this vertex’s best height.
+        - Return (beta_opt, loss_reduction, neighbors, n_points).
+        """
         # 1) which faces / neighbors?
         if self.active:
             neighbors, faces = self.get_faces()
@@ -402,15 +628,13 @@ class Vertex:
             
 
         if not faces:
-            self.mesh.bad_vertex = self
-            print('vertex',self,'regressed without being attached to faces')
-            print('real', self.real_vertex)
-            return {self: float(self.height)}, 0.0, neighbors
+            return float(self.height), 0.0, neighbors, 0
 
 
 
         # 2) design matrix for those faces
         X, rows, col_key = self.build_design_matrix(faces)
+        points_attached = len(X)
         y = pd.Series(self.mesh.values, index=self.mesh.index, dtype=float).loc[rows].to_numpy()
 
         # 3) fixed contribution from neighbors ("correction")
@@ -445,16 +669,12 @@ class Vertex:
 
         loss_reduction = orig_loss - sse_post
 
-        return float(beta_opt), float(loss_reduction), neighbors
+        return float(beta_opt), float(loss_reduction), neighbors, points_attached
 
         
 
 
-    def update_heights(self):
-        for v, b in self.height_dict.items():
-            v.height = b
-        for v in self.to_update:
-            v.loc_regress()
+
     
     
     @property
@@ -546,6 +766,7 @@ class Edge:
         self.vertex1 = vertex1
         self.mesh = mesh
         self.faces = dict({'+': None, '-': None})
+        self.disqualifying = set()
         self.opposing_vertices = dict({'+': None, '-': None})
         
         
@@ -554,7 +775,8 @@ class Edge:
 
         # unit normal as numpy array
         n = np.array([-dy, dx], dtype=float)
-        n /= np.linalg.norm(n)
+        self.length = np.linalg.norm(n)
+        n /= self.length
         self.normal = n
 
         # signed line equation: normal · p = intercept
@@ -624,8 +846,6 @@ class Edge:
         self.mesh.active_edges.discard(self)
         self.vertex0.remove_edge(self)
         self.vertex1.remove_edge(self)
-        if self.midpoint is not None:
-            self.mesh.midpoints.discard(self.midpoint)
             
     def test_vertex(self, v: Vertex) -> float:
         return np.array(v) @ self.normal - self.intercept  
@@ -638,6 +858,15 @@ class Edge:
         
     
     def add_face(self, face: 'Face'):
+        """
+        Attach a face to this edge and precompute its subdivision.
+        
+        - Decide whether face is '+' or '-' side (by testing opposing vertex).
+        - Store face + opposing vertex in self.faces / self.opposing_vertices.
+        - Build internal chord (midpoint → opposing_vertex) in self.sub_edges.
+        - Create the two child faces (mask split + path update).
+        - Register subdivision so face.split(edge) can later activate them.
+        """
         idx = face.edges.index(self)
         opposing_vertex = face.vertices[idx]
         if self.test_vertex(opposing_vertex) > 0:
@@ -675,10 +904,16 @@ class Edge:
         if face_type == '+':
             face.add_sub_division(self, {'e': self.sub_edges[face_type], '+': face0, '-': face1})
         else:
-            face.add_sub_division(self, {'e': self.sub_edges[face_type], '+': face1, '-': face0})
+            face.add_sub_division(self, {'e': self.sub_edges[face_type], '+': face1, '-': face0})   
+        
+        if max(face0.aspect_ratio(),face1.aspect_ratio())>= self.mesh.max_aspect_ratio:
+            self.disqualifying.add(face)
+            if not self.midpoint.disqualified:
+                self.midpoint.disqualified = True
+                self.mesh.loss_heap.pop(self.midpoint, None)
+                
             
         
-
         self.midpoint.update_info()
     
     def remove_face(self, face):
@@ -686,6 +921,10 @@ class Edge:
             self.faces['+'] = None
         if self.faces['-'] is face:
             self.faces['-'] = None
+        
+        self.disqualifying.discard(face)
+        if len(self.disqualifying) == 0:
+            self.midpoint.disqualified = False
 class Face:
     """
     Faces should carry the bulk of information
@@ -780,7 +1019,8 @@ class Face:
         return 0.5 * np.abs(det)
     
 
-    
+    def aspect_ratio(self):
+        return max(edge.length for edge in self.edges)/min(edge.length for edge in self.edges)
     
     def update_coords(self, eps=1e-14):
         """
@@ -822,7 +1062,61 @@ class Face:
         self.sub_divisions[idx] = sub_division
         
 
-            
+
+    def affine_height_model(self, eps: float = 1e-12):
+        """
+        Build the affine model z(x,y) = m·[x,y] + b that interpolates the
+        current vertex heights of this triangular face.
+
+        Returns
+        -------
+        m : np.ndarray shape (2,)
+            Linear coefficients [a, b] so z = a*x + b*y + c.
+        b : float
+            Intercept c.
+        f : callable
+            Evaluator: f(xy) where xy is shape (2,) or (n,2). Returns float or np.ndarray.
+        """
+        v0, v1, v2 = self.vertices
+        A = np.array([
+            [v0.x, v0.y, 1.0],
+            [v1.x, v1.y, 1.0],
+            [v2.x, v2.y, 1.0],
+        ], dtype=float)
+        h = np.array([float(getattr(v0, "height", np.nan)),
+                      float(getattr(v1, "height", np.nan)),
+                      float(getattr(v2, "height", np.nan))], dtype=float)
+
+        # Degenerate triangle or bad data -> NaNs
+        detA = np.linalg.det(A)
+        if not np.isfinite(detA) or abs(detA) < eps or not np.all(np.isfinite(h)):
+            m = np.array([np.nan, np.nan], dtype=float)
+            c = float("nan")
+            def f_bad(X):
+                X = np.asarray(X, dtype=float)
+                if X.ndim == 1:
+                    return float("nan")
+                if X.ndim == 2 and X.shape[1] == 2:
+                    return np.full((X.shape[0],), np.nan, dtype=float)
+                raise ValueError("X must be shape (2,) or (n,2)")
+            return m, c, f_bad
+
+        a_, b_, c = np.linalg.solve(A, h)  # z = a_*x + b_*y + c
+        m = np.array([a_, b_], dtype=float)
+        c = float(c)
+
+        def f(X):
+            X = np.asarray(X, dtype=float)
+            if X.ndim == 1:
+                if X.shape[0] != 2:
+                    raise ValueError("X must be length-2 when 1D")
+                return float(X @ m + c)
+            if X.ndim == 2 and X.shape[1] == 2:
+                return (X @ m) + c
+            raise ValueError("X must be shape (2,) or (n,2)")
+
+        return m, c, f
+
         
     
     def as_patch(self, **kwargs):
