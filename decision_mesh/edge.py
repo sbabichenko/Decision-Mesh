@@ -86,10 +86,9 @@ class Edge:
         self.midpoint = Vertex(self.mesh, (self.vertex0.x + self.vertex1.x)/2, (self.vertex0.y + self.vertex1.y)/2, parent_edge=self)
 
     def split(self):
-        if self.faces['+']:
-            self.faces['+'].split(self)
-        if self.faces['-']:
-            self.faces['-'].split(self)
+        for sign in ('+', '-'):
+            while self.faces.get(sign) is not None:
+                self.faces[sign].split(self)
 
         self.sub_edges['0'].activate()
         self.sub_edges['1'].activate()
@@ -152,8 +151,8 @@ class Edge:
             path0 = face.path + '-'
             path1 = face.path + '+'
 
-        face0 = Face(self.mesh, self.sub_edges[face_type], edge0, self.sub_edges['0'], mask0, False, path0)
-        face1 = Face(self.mesh, self.sub_edges[face_type], edge1, self.sub_edges['1'], mask1, False, path1)
+        face0 = Face(self.mesh, edge0, self.sub_edges['0'], self.sub_edges[face_type], mask0, False, path0)
+        face1 = Face(self.mesh, edge1, self.sub_edges[face_type], self.sub_edges['1'], mask1, False, path1)
 
         if face_type == '+':
             face.add_sub_division(self, {'e': self.sub_edges[face_type], '+': face0, '-': face1})

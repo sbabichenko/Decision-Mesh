@@ -73,9 +73,21 @@ class Face:
     def addnode(self, node: TreeNode):
         self.node = node
 
+    @property
+    def refinement_edge(self) -> Edge:
+        """The edge opposite the newest vertex -- the only edge this face may be split along."""
+        return self.edges[0]
+
     def split(self, edge: Edge):
-        idx = self.edges.index(edge)
-        sub_division = self.sub_divisions[idx]
+        if edge is not self.edges[0]:
+            # Completion: must split along refinement edge first.
+            # After this, the face is replaced by children; the caller's
+            # while-loop in Edge.split() will pick up the child that
+            # now shares `edge`.
+            self.edges[0].midpoint.activate()
+            return
+
+        sub_division = self.sub_divisions[0]
         if sub_division['e'] is None:
             raise ValueError("Edge has not been activated/split yet.")
 
