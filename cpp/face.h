@@ -33,11 +33,8 @@ struct Face {
     // mask: indices of data points in this face
     std::vector<bool> mask;
 
-    // Barycentric coordinates: for each masked point, weights [w0, w1, w2]
-    // coords_indices[i] = index into global data array
-    // coords_weights[i] = {w0, w1, w2} for vertices[0..2]
+    // Indices of data points inside this face
     std::vector<int> coords_indices;
-    std::vector<std::array<double, 3>> coords_weights;
 
     // Sufficient statistics for regression (computed once in update_coords)
     // S_ww[i][j] = Σ w_i * w_j over all points in face
