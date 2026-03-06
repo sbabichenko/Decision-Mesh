@@ -1,0 +1,254 @@
+\documentclass{article}
+\usepackage{amsmath, amssymb}
+\usepackage{booktabs}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage[margin=1in]{geometry}
+\usepackage{hyperref}
+
+\title{Decision Mesh: Algorithm Description}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\section{Overview}
+
+Decision Mesh is an adaptive 2D surface fitting algorithm. Given scattered data points $(x_i, y_i, z_i)$ for $i = 1, \dots, n$, it builds a triangular mesh over the $(x, y)$ domain and assigns a height $h_v$ to each mesh vertex $v$. The predicted value for any query point is the barycentric interpolation of the three vertex heights of the enclosing triangle. The mesh is refined greedily: at each step, the vertex whose activation would most reduce the total squared error is chosen.
+
+\section{Data Structures}
+
+\subsection{Vertex}
+A 2D point $(x, y)$ with a scalar height $h$. Each vertex tracks:
+\begin{itemize}
+    \item \textbf{edges}: set of active edges incident to it
+    \item \textbf{parent\_edge}: the edge this vertex is the midpoint of (\texttt{null} for corner vertices)
+    \item \textbf{active}: whether this vertex has been activated
+    \item \textbf{new\_height}: the optimal height $\hat{\beta}$ computed by local regression
+    \item \textbf{loss\_reduction}: how much total loss would decrease if this vertex were activated/updated
+    \item \textbf{heap\_key}: cached key in the priority queue for $O(\log n)$ removal
+    \item \textbf{affected\_vertices}: set of neighboring vertices whose regression changes if this vertex is activated
+\end{itemize}
+
+\subsection{Edge}
+Connects two vertices $v_0, v_1$. Stores:
+\begin{itemize}
+    \item \textbf{normal}, \textbf{intercept}: the half-plane equation $\mathbf{n} \cdot \mathbf{p} = c$ (the line through the edge)
+    \item \textbf{midpoint}: a vertex at $\frac{v_0 + v_1}{2}$ (created when the edge is activated)
+    \item \textbf{faces[2]}: the two faces on each side of the edge (indexed by sign of \texttt{test\_vertex})
+    \item \textbf{sub\_edges[4]}: \texttt{[0]} = half-edge $v_0 \to$ midpoint, \texttt{[1]} = half-edge midpoint $\to v_1$, \texttt{[2]} = chord to opposing vertex on $+$ side, \texttt{[3]} = chord to opposing vertex on $-$ side
+\end{itemize}
+
+\subsection{Face (Triangle)}
+Three edges, three vertices:
+\begin{itemize}
+    \item \textbf{edges[3]}: \texttt{edges[0]} is the \emph{refinement edge} (opposite the newest vertex)
+    \item \textbf{vertices[3]}: \texttt{vertices[0]} is opposite \texttt{edges[0]} (the newest vertex, always the right-angle vertex)
+    \item \textbf{coords\_indices}: indices of data points covered by this triangle
+    \item \textbf{Sufficient statistics}: $S_{ww} \in \mathbb{R}^{3\times3}$, $S_{wy} \in \mathbb{R}^3$, $S_{yy} \in \mathbb{R}$, $n_{\text{covered}}$
+    \item \textbf{sub\_divisions[3]}: pre-computed child faces for each possible split edge
+\end{itemize}
+
+\subsection{TreeNode}
+Binary tree mirroring the face hierarchy. Each internal node stores the splitting edge's normal $\mathbf{n}$ and intercept $c$. Leaves correspond to active faces.
+
+\subsection{DecisionMesh}
+Top-level container holding all objects, the priority queue (\texttt{loss\_heap}), and the data arrays $X \in \mathbb{R}^{n \times 2}$, $\mathbf{z} \in \mathbb{R}^n$.
+
+\section{Initialization}
+
+\begin{enumerate}
+    \item Compute the bounding box $[x_{\min}, x_{\max}] \times [y_{\min}, y_{\max}]$.
+    \item Create 4 corner vertices.
+    \item Create 4 boundary edges (initially inactive).
+    \item Create the diagonal edge from bottom-left to top-right (active).
+    \item Classify all $n$ points to the $+$ or $-$ side of the diagonal using $\mathbf{n} \cdot \mathbf{p} \geq c$.
+    \item Create two initial right triangles, one per side.
+    \item For each face, compute barycentric weights and accumulate sufficient statistics.
+    \item The root \texttt{TreeNode} splits into two children.
+    \item Call \texttt{update\_info()} on all vertices to populate their loss reductions and insert them into the priority queue.
+\end{enumerate}
+
+\section{Right-Triangle Barycentric Coordinates}
+
+Every face is a right triangle with the right-angle vertex at $v_0$ (opposite the hypotenuse \texttt{edges[0]}). Let $\mathbf{a} = v_1 - v_0$ and $\mathbf{b} = v_2 - v_0$ be the two legs. Since $\mathbf{a} \perp \mathbf{b}$ (i.e., $\mathbf{a} \cdot \mathbf{b} = 0$), the barycentric coordinates for a point $\mathbf{p}$ relative to $v_0$ simplify to:
+
+\begin{align}
+    u &= \frac{(\mathbf{p} - v_0) \cdot \mathbf{a}}{|\mathbf{a}|^2} \qquad \text{(weight for } v_1\text{)} \\
+    v &= \frac{(\mathbf{p} - v_0) \cdot \mathbf{b}}{|\mathbf{b}|^2} \qquad \text{(weight for } v_2\text{)} \\
+    w_0 &= 1 - u - v \qquad\qquad\;\; \text{(weight for } v_0\text{)}
+\end{align}
+
+This eliminates the cross-term $\mathbf{a} \cdot \mathbf{b}$ and the determinant $|\mathbf{a}|^2 |\mathbf{b}|^2 - (\mathbf{a} \cdot \mathbf{b})^2$ from the general formula, replacing it with two independent dot-product-and-divide operations.
+
+\section{Sufficient Statistics}
+
+Each face maintains aggregate statistics computed in a single pass during creation:
+
+\begin{align}
+    (S_{ww})_{ij} &= \sum_{r=1}^{n_f} w_{i,r} \, w_{j,r} \qquad (3 \times 3 \text{ symmetric matrix}) \\
+    (S_{wy})_i &= \sum_{r=1}^{n_f} w_{i,r} \, y_r \qquad\quad (3\text{-vector}) \\
+    S_{yy} &= \sum_{r=1}^{n_f} y_r^2 \qquad\qquad\;\;\, (\text{scalar})
+\end{align}
+
+where $w_{i,r}$ is the barycentric weight of vertex $i$ for data point $r$, $y_r$ is the response value, and $n_f$ is the number of points in the face.
+
+\section{Local Regression}
+
+To compute the optimal height for vertex $s$ and the resulting loss reduction:
+
+\begin{enumerate}
+    \item Gather all faces $\mathcal{F}$ containing vertex $s$.
+    \item For each face $f \in \mathcal{F}$, let $s_i$ be the index of vertex $s$ in face $f$. Let $h_j$ denote the current height of vertex $j$.
+    \item Accumulate across faces:
+    \begin{align}
+        x^T x &= \sum_{f \in \mathcal{F}} (S_{ww}^f)_{s_i, s_i} \\
+        x^T r &= \sum_{f \in \mathcal{F}} \left[ (S_{wy}^f)_{s_i} - \sum_{j \neq s_i} h_j \, (S_{ww}^f)_{s_i, j} \right] \\
+        r^T r &= \sum_{f \in \mathcal{F}} \left[ S_{yy}^f - 2 \sum_{j \neq s_i} h_j \, (S_{wy}^f)_j + \sum_{j \neq s_i} \sum_{k \neq s_i} h_j \, h_k \, (S_{ww}^f)_{j,k} \right]
+    \end{align}
+    \item Compute optimal height:
+    \begin{equation}
+        \hat{\beta} = \frac{x^T r}{x^T x}
+    \end{equation}
+    \item Compute loss reduction:
+    \begin{align}
+        L_{\text{orig}} &= r^T r - 2 h_{\text{current}} \cdot x^T r + h_{\text{current}}^2 \cdot x^T x \\
+        L_{\text{opt}} &= r^T r - \frac{(x^T r)^2}{x^T x} \\
+        \Delta L &= L_{\text{orig}} - L_{\text{opt}}
+    \end{align}
+\end{enumerate}
+
+This is $O(|\mathcal{F}|)$ per vertex, typically $O(1)$ amortized---no iteration over data points.
+
+\section{Priority Queue}
+
+The priority queue is a sorted map from $-\Delta L$ (negated loss reduction) to sets of vertices. The most negative key (highest priority) is accessed via the map's \texttt{begin()}.
+
+Each vertex caches its \texttt{heap\_key}, enabling:
+\begin{itemize}
+    \item \textbf{heap\_set}$(v, k)$: $O(\log n)$ --- remove old entry by looking up cached key, insert at new key
+    \item \textbf{heap\_pop}$(v)$: $O(\log n)$ --- remove by cached key lookup
+    \item \textbf{heap\_peek}$()$: $O(1)$ --- return the first entry
+\end{itemize}
+
+\section{Refinement Loop}
+
+\begin{algorithm}[H]
+\caption{Greedy Mesh Refinement}
+\begin{algorithmic}[1]
+\While{time remaining}
+    \State $(v^*, k) \gets \textsc{HeapPeek}()$
+    \If{$v^*$ is active}
+        \State $h_{v^*} \gets \hat{\beta}_{v^*}$ \Comment{Update height}
+        \ForAll{$u \in \text{affected}(v^*)$}
+            \State \Call{UpdateInfo}{$u$}
+        \EndFor
+        \State \Call{HeapSet}{$v^*, 0$}
+    \Else
+        \State \Call{Activate}{$v^*$} \Comment{Split parent edge, create new faces}
+    \EndIf
+\EndWhile
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Vertex Activation}
+
+\begin{algorithm}[H]
+\caption{Activate($v$)}
+\begin{algorithmic}[1]
+    \State $v.\text{active} \gets \textbf{true}$
+    \State $h_v \gets \hat{\beta}_v$
+    \State \Call{Split}{$v.\text{parent\_edge}$} \Comment{Splits adjacent faces}
+    \ForAll{$u \in \text{affected}(v)$}
+        \State \Call{UpdateInfo}{$u$}
+    \EndFor
+    \State \Call{HeapSet}{$v, 0$}
+\end{algorithmic}
+\end{algorithm}
+
+\section{Edge Splitting}
+
+\begin{algorithm}[H]
+\caption{Edge.Split()}
+\begin{algorithmic}[1]
+    \For{each side $\sigma \in \{+, -\}$}
+        \While{$\text{faces}[\sigma] \neq \textbf{null}$}
+            \State \Call{faces[$\sigma$].Split}{this edge}
+        \EndWhile
+    \EndFor
+    \State Activate sub-edges $[0]$ and $[1]$ (the two half-edges)
+    \State Deactivate this edge
+\end{algorithmic}
+\end{algorithm}
+
+\section{Newest Vertex Bisection with Completion}
+
+\begin{algorithm}[H]
+\caption{Face.Split(edge)}
+\begin{algorithmic}[1]
+    \If{edge $\neq$ \texttt{edges[0]}} \Comment{Not the refinement edge}
+        \State \Call{Activate}{\texttt{edges[0].midpoint}} \Comment{Completion: split along refinement edge first}
+        \State \Return \Comment{Caller's while-loop picks up the child face}
+    \EndIf
+    \State Deactivate this face
+    \State Activate the two pre-computed child faces from \texttt{sub\_divisions[0]}
+    \State Update the decision tree node
+\end{algorithmic}
+\end{algorithm}
+
+The completion cascade terminates because each recursive step splits a face along its refinement edge, producing children whose refinement edges are older (higher in the hierarchy). The chain has finite depth bounded by the mesh hierarchy.
+
+\section{Child Face Pre-computation (Edge.AddFace)}
+
+When a face is activated, each of its edges calls \textsc{AddFace} to pre-compute the sub-division:
+
+\begin{enumerate}
+    \item Find the opposing vertex (the face vertex not on this edge).
+    \item Determine which side ($+$ or $-$) the opposing vertex is on via $\mathbf{n} \cdot v_{\text{opp}} - c$.
+    \item Create a chord sub-edge from the midpoint to the opposing vertex.
+    \item Classify the parent face's \texttt{coords\_indices} to two sides of the chord (iterating only the parent's covered points, not all $n$).
+    \item Create two child faces with edges ordered so the old parent edge is at position \texttt{[0]} (making it the child's refinement edge).
+    \item Each child computes its sufficient statistics from its subset of point indices.
+    \item Check aspect ratio; if too extreme, disqualify the midpoint from the heap.
+    \item Call \textsc{UpdateInfo} on the midpoint.
+\end{enumerate}
+
+\section{Prediction}
+
+To predict $z$ for a query point $(x, y)$:
+\begin{enumerate}
+    \item Start at the root \texttt{TreeNode}.
+    \item At each internal node, compute $\mathbf{n} \cdot (x, y)$ vs.\ intercept $c$. Go to $+$ child if $\geq c$, else $-$ child.
+    \item At a leaf, compute barycentric weights $(w_0, u, v)$ and interpolate: $\hat{z} = w_0 h_0 + u h_1 + v h_2$.
+\end{enumerate}
+
+\section{Complexity}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{ll}
+\toprule
+\textbf{Operation} & \textbf{Cost} \\
+\midrule
+Find best vertex (heap peek) & $O(1)$ \\
+Heap insert/update/remove & $O(\log n)$ \\
+Vertex activation (split) & $O(k)$, $k$ = points in affected faces \\
+Local regression & $O(|\mathcal{F}|) \approx O(1)$ \\
+Prediction query & $O(\log |\text{faces}|)$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Key Optimizations}
+
+\begin{enumerate}
+    \item \textbf{Sufficient statistics}: Replaces $O(n_{\text{points}})$ design matrix construction with $O(|\mathcal{F}|)$ accumulation per regression.
+    \item \textbf{Right-triangle barycentric}: Eliminates cross-term from perpendicular legs.
+    \item \textbf{Index-based splitting}: Child faces inherit only the parent's point indices, not scanning all $n$ points.
+    \item \textbf{$O(\log n)$ heap with cached keys}: Each vertex stores its heap key for direct lookup instead of $O(n)$ linear scan.
+    \item \textbf{Pre-computed sub-divisions}: \textsc{AddFace} eagerly pre-computes child faces, so \textsc{Split} is just a deactivate/activate swap.
+    \item \textbf{Newest vertex bisection with completion}: Guarantees all triangles remain right triangles, preserving the barycentric simplification.
+\end{enumerate}
+
+\end{document}
