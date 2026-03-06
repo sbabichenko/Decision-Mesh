@@ -15,8 +15,9 @@ CascadeCounters g_counters;
 
 DecisionMesh::DecisionMesh(const std::vector<double>& x_data,
                            const std::vector<double>& y_data,
-                           const std::vector<double>& z_data)
-    : rng(42)
+                           const std::vector<double>& z_data,
+                           bool use_eb_flag)
+    : rng(42), use_eb(use_eb_flag)
 {
     n_points = (int)x_data.size();
     X.resize(n_points * 2);
@@ -52,6 +53,17 @@ DecisionMesh::DecisionMesh(const std::vector<double>& x_data,
 
     for (Vertex* v : std::set<Vertex*>(vertices)) {
         v->update_info();
+    }
+
+    // Bootstrap empirical Bayes: compute tau_sq from initial estimates,
+    // then re-update non-corner vertices with regularization
+    if (use_eb) {
+        recompute_tau_sq();
+        for (Vertex* v : std::set<Vertex*>(vertices)) {
+            if (v->parent_edge != nullptr) {
+                v->update_info();
+            }
+        }
     }
 }
 
@@ -160,6 +172,10 @@ Face* DecisionMesh::random_face() {
 }
 
 void DecisionMesh::update_best_vertex(double) {
+    if (use_eb) {
+        maybe_recompute_tau_sq();
+    }
+
     auto [best, _] = heap_peek();
     if (!best) return;
 
@@ -174,6 +190,10 @@ TimingRecord DecisionMesh::update_best_vertex_timed(double random_prob, int iter
     using clock = std::chrono::high_resolution_clock;
     TimingRecord rec{};
     rec.iteration = iteration;
+
+    if (use_eb) {
+        maybe_recompute_tau_sq();
+    }
 
     // Phase 1: Find best vertex (heap peek is O(1))
     auto t0 = clock::now();
@@ -192,11 +212,16 @@ TimingRecord DecisionMesh::update_best_vertex_timed(double random_prob, int iter
     g_counters = CascadeCounters{};
     auto t2 = clock::now();
     if (best->active) {
-        // update_height: sets height, then calls update_info on affected
         best->height = best->new_height;
-        // We split the "split" part (just height assignment) from update_info propagation
+        if (best->parent_edge != nullptr) {
+            best->delta_pooled = best->height - best->mu_lin();
+        }
         auto t2b = clock::now();
-        for (Vertex* v : best->affected_vertices) {
+        std::set<Vertex*> to_update(best->affected_vertices);
+        if (use_eb) {
+            to_update.insert(best->prior_children.begin(), best->prior_children.end());
+        }
+        for (Vertex* v : to_update) {
             v->update_info();
         }
         best->loss_reduction = 0;
@@ -208,9 +233,22 @@ TimingRecord DecisionMesh::update_best_vertex_timed(double random_prob, int iter
         // activate: set height, split parent edge (creates new faces), then update_info
         best->active = true;
         best->height = best->new_height;
+
+        // Set EB posterior fields before split
+        if (use_eb && best->parent_edge != nullptr) {
+            best->delta_pooled = best->height - best->mu_lin();
+            double inv_sigma = (best->sigma_sq < 1e300) ? (1.0 / best->sigma_sq) : 0.0;
+            double xTx_reg = inv_sigma + best->lambda_v;
+            best->sigma_pooled = (xTx_reg > 0) ? (1.0 / xTx_reg) : 1e300;
+        }
+
         best->parent_edge->split();
         auto t2b = clock::now();
-        for (Vertex* v : best->affected_vertices) {
+        std::set<Vertex*> to_update(best->affected_vertices);
+        if (use_eb) {
+            to_update.insert(best->prior_children.begin(), best->prior_children.end());
+        }
+        for (Vertex* v : to_update) {
             v->update_info();
         }
         best->loss_reduction = 0;
@@ -230,6 +268,94 @@ TimingRecord DecisionMesh::update_best_vertex_timed(double random_prob, int iter
     rec.add_face_calls = g_counters.add_face_calls;
     rec.update_info_calls = g_counters.update_info_calls;
     return rec;
+}
+
+// --- Empirical Bayes ---
+
+void DecisionMesh::recompute_tau_sq() {
+    // Group non-corner vertices by depth
+    std::map<int, std::vector<Vertex*>> by_depth;
+    for (Vertex* v : vertices) {
+        if (v->parent_edge == nullptr) continue;
+        if (v->sigma_sq >= 1e300 || v->sigma_sq <= 0) continue;
+        by_depth[v->depth].push_back(v);
+    }
+
+    for (auto& [d, verts] : by_depth) {
+        int m = (int)verts.size();
+        tau_sq_vertex_counts[d] = m;
+
+        if (m < 3) continue;
+
+        double sum_w = 0.0;
+        double sum_wd = 0.0;
+        for (Vertex* v : verts) {
+            double w = 1.0 / v->sigma_sq;
+            sum_w += w;
+            sum_wd += v->delta_pooled * w;
+        }
+        if (sum_w <= 0) continue;
+
+        double mu_d = sum_wd / sum_w;
+        mu_delta[d] = mu_d;
+
+        double chi_sq = 0.0;
+        for (Vertex* v : verts) {
+            double diff = v->delta_pooled - mu_d;
+            chi_sq += diff * diff / v->sigma_sq;
+        }
+        double tau = std::max(0.0, (chi_sq - (m - 1)) / sum_w);
+        tau_sq[d] = tau;
+    }
+
+    // For depths with < 3 vertices, borrow from nearest depth
+    std::vector<int> depths_with_tau;
+    for (auto& [d, _] : tau_sq) depths_with_tau.push_back(d);
+    std::sort(depths_with_tau.begin(), depths_with_tau.end());
+
+    if (!depths_with_tau.empty()) {
+        for (auto& [d, _] : by_depth) {
+            if (tau_sq.find(d) == tau_sq.end()) {
+                int nearest = depths_with_tau[0];
+                for (int d2 : depths_with_tau) {
+                    if (std::abs(d2 - d) < std::abs(nearest - d)) nearest = d2;
+                }
+                tau_sq[d] = tau_sq[nearest];
+                if (mu_delta.find(d) == mu_delta.end()) {
+                    auto it = mu_delta.find(nearest);
+                    mu_delta[d] = (it != mu_delta.end()) ? it->second : 0.0;
+                }
+            }
+        }
+    }
+
+    steps_since_tau_recompute = 0;
+}
+
+void DecisionMesh::maybe_recompute_tau_sq() {
+    steps_since_tau_recompute++;
+
+    if (steps_since_tau_recompute >= tau_sq_recompute_interval) {
+        recompute_tau_sq();
+        return;
+    }
+
+    // Check if any depth has grown by 50%
+    std::map<int, int> by_depth;
+    for (Vertex* v : vertices) {
+        if (v->parent_edge != nullptr && v->sigma_sq < 1e300) {
+            by_depth[v->depth]++;
+        }
+    }
+
+    for (auto& [d, count] : by_depth) {
+        auto it = tau_sq_vertex_counts.find(d);
+        int old_count = (it != tau_sq_vertex_counts.end()) ? it->second : 0;
+        if (old_count > 0 && count >= (int)(old_count * 1.5)) {
+            recompute_tau_sq();
+            return;
+        }
+    }
 }
 
 void DecisionMesh::create_outer_vertices() {

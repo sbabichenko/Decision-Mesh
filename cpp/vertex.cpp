@@ -21,8 +21,15 @@ Vertex::Vertex(DecisionMesh* mesh, double x, double y, bool active,
     }
     if (parent_edge) {
         height = (parent_edge->vertex0->height + parent_edge->vertex1->height) / 2.0;
+        depth = std::max(parent_edge->vertex0->depth, parent_edge->vertex1->depth) + 1;
+        // Register with parent edge endpoints for prior propagation
+        if (real_vertex) {
+            parent_edge->vertex0->prior_children.insert(this);
+            parent_edge->vertex1->prior_children.insert(this);
+        }
     } else {
         height = 0.0;
+        depth = 0;
     }
 }
 
@@ -49,8 +56,22 @@ void Vertex::activate() {
     g_counters.cascade_activations++;
     active = true;
     height = new_height;
+
+    // Set EB posterior fields before split (new midpoints need these during split)
+    if (mesh->use_eb && parent_edge != nullptr) {
+        delta_pooled = height - mu_lin();
+        double inv_sigma = (sigma_sq < 1e300) ? (1.0 / sigma_sq) : 0.0;
+        double xTx_reg = inv_sigma + lambda_v;
+        sigma_pooled = (xTx_reg > 0) ? (1.0 / xTx_reg) : 1e300;
+    }
+
     parent_edge->split();
-    for (Vertex* v : affected_vertices) {
+
+    std::set<Vertex*> to_update(affected_vertices);
+    if (mesh->use_eb) {
+        to_update.insert(prior_children.begin(), prior_children.end());
+    }
+    for (Vertex* v : to_update) {
         v->update_info();
     }
     loss_reduction = 0;
@@ -60,10 +81,47 @@ void Vertex::activate() {
 void Vertex::update_info() {
     g_counters.update_info_calls++;
     auto result = loc_regress();
-    new_height = result.beta_opt;
-    loss_reduction = result.loss_reduction;
     affected_vertices = result.affected;
     affected_points = result.n_points;
+
+    double xTx = result.xTx;
+    double xTr = result.xTr;
+    double rTr = result.rTr;
+
+    sigma_sq = (xTx > 0) ? (1.0 / xTx) : 1e300;
+
+    if (mesh->use_eb) {
+        auto [lv, mu_v] = compute_eb_params(xTx);
+        lambda_v = lv;
+
+        if (lv > 0 && xTx > 0) {
+            double xTx_reg = xTx + lv;
+            double xTr_reg = xTr + lv * mu_v;
+            double beta_reg = xTr_reg / xTx_reg;
+
+            double beta_orig = height;
+            double orig_loss = beta_orig * beta_orig * xTx
+                             - 2.0 * beta_orig * xTr + rTr
+                             + lv * (beta_orig - mu_v) * (beta_orig - mu_v);
+            double sse_post = rTr + lv * mu_v * mu_v - xTr_reg * xTr_reg / xTx_reg;
+
+            new_height = beta_reg;
+            loss_reduction = std::max(0.0, orig_loss - sse_post);
+            sigma_pooled = 1.0 / xTx_reg;
+            delta_pooled = beta_reg - mu_lin();
+        } else {
+            new_height = result.beta_opt;
+            loss_reduction = result.loss_reduction;
+            if (parent_edge != nullptr && xTx > 0) {
+                delta_pooled = result.beta_opt - mu_lin();
+                sigma_pooled = sigma_sq;
+            }
+        }
+    } else {
+        new_height = result.beta_opt;
+        loss_reduction = result.loss_reduction;
+    }
+
     if (!disqualified) {
         mesh->heap_set(this, -loss_reduction);
     }
@@ -71,7 +129,14 @@ void Vertex::update_info() {
 
 void Vertex::update_height() {
     height = new_height;
-    for (Vertex* v : affected_vertices) {
+    if (parent_edge != nullptr) {
+        delta_pooled = height - mu_lin();
+    }
+    std::set<Vertex*> to_update(affected_vertices);
+    if (mesh->use_eb) {
+        to_update.insert(prior_children.begin(), prior_children.end());
+    }
+    for (Vertex* v : to_update) {
         v->update_info();
     }
     loss_reduction = 0;
@@ -151,6 +216,9 @@ Vertex::LocRegressResult Vertex::loc_regress() {
     res.beta_opt = height;
     res.loss_reduction = 0.0;
     res.n_points = 0;
+    res.xTx = 0.0;
+    res.xTr = 0.0;
+    res.rTr = 0.0;
 
     FacesResult fr;
     if (active) {
@@ -164,23 +232,10 @@ Vertex::LocRegressResult Vertex::loc_regress() {
         return res;
     }
 
-    // Use per-face sufficient statistics to compute 1D least squares
-    // without iterating over individual data points.
-    //
-    // For vertex "self" at index si in face f:
-    //   residual_r = y_r - Σ_{j≠si} w_jr * h_j
-    //   x_self_r   = w_{si,r}
-    //
-    // xTx += f.S_ww[si][si]
-    // xTr += f.S_wy[si] - Σ_{j≠si} h_j * f.S_ww[si][j]
-    // rTr += f.S_yy - 2*Σ_{j≠si} h_j*f.S_wy[j]
-    //        + Σ_{j≠si} Σ_{k≠si} h_j*h_k*f.S_ww[j][k]
-
     double xTx = 0.0, xTr = 0.0, rTr = 0.0;
     int total_points = 0;
 
     for (Face* f : fr.faces) {
-        // Find which vertex index in this face is "self"
         int si = -1;
         for (int i = 0; i < 3; ++i) {
             if (f->vertices[i] == this) { si = i; break; }
@@ -189,14 +244,12 @@ Vertex::LocRegressResult Vertex::loc_regress() {
 
         total_points += f->n_covered;
 
-        // Gather neighbor heights for this face
         double h[3];
         for (int i = 0; i < 3; ++i)
             h[i] = f->vertices[i]->height;
 
         xTx += f->S_ww[si][si];
 
-        // xTr contribution
         double xTr_face = f->S_wy[si];
         for (int j = 0; j < 3; ++j) {
             if (j == si) continue;
@@ -204,7 +257,6 @@ Vertex::LocRegressResult Vertex::loc_regress() {
         }
         xTr += xTr_face;
 
-        // rTr contribution: ||y - Σ_{j≠si} w_j h_j||²
         double rTr_face = f->S_yy;
         for (int j = 0; j < 3; ++j) {
             if (j == si) continue;
@@ -219,11 +271,9 @@ Vertex::LocRegressResult Vertex::loc_regress() {
 
     if (total_points == 0) return res;
 
-    // Original loss with current height
     double beta_orig = height;
     double orig_loss = rTr - 2.0 * beta_orig * xTr + beta_orig * beta_orig * xTx;
 
-    // Optimal 1D least squares
     double beta_opt, sse_post;
     if (xTx > 0.0) {
         beta_opt = xTr / xTx;
@@ -236,5 +286,109 @@ Vertex::LocRegressResult Vertex::loc_regress() {
     res.beta_opt = beta_opt;
     res.loss_reduction = orig_loss - sse_post;
     res.n_points = total_points;
+    res.xTx = xTx;
+    res.xTr = xTr;
+    res.rTr = rTr;
     return res;
+}
+
+// --- Empirical Bayes helpers ---
+
+double Vertex::mu_lin() const {
+    if (parent_edge == nullptr) return 0.0;
+    return (parent_edge->vertex0->height + parent_edge->vertex1->height) / 2.0;
+}
+
+double Vertex::compute_overlap_factor(Vertex* a, Vertex* b) const {
+    // Collect faces of a
+    std::set<Face*> faces_a, faces_b;
+    for (Edge* e : a->edges) {
+        for (int s = 0; s < 2; ++s) {
+            Face* f = e->faces[s];
+            if (f) {
+                for (int i = 0; i < 3; ++i) {
+                    if (f->vertices[i] == a) { faces_a.insert(f); break; }
+                }
+            }
+        }
+    }
+    for (Edge* e : b->edges) {
+        for (int s = 0; s < 2; ++s) {
+            Face* f = e->faces[s];
+            if (f) {
+                for (int i = 0; i < 3; ++i) {
+                    if (f->vertices[i] == b) { faces_b.insert(f); break; }
+                }
+            }
+        }
+    }
+
+    // shared faces
+    int n_shared = 0, n_a = 0, n_b = 0;
+    for (Face* f : faces_a) n_a += f->n_covered;
+    for (Face* f : faces_b) n_b += f->n_covered;
+    for (Face* f : faces_a) {
+        if (faces_b.count(f)) n_shared += f->n_covered;
+    }
+
+    int denom = n_a + n_b - n_shared;
+    if (denom <= 0) return 0.0;
+    return (double)n_shared / denom;
+}
+
+std::pair<double, double> Vertex::compute_eb_params(double xTx) const {
+    if (parent_edge == nullptr || xTx <= 0) return {0.0, 0.0};
+
+    auto it = mesh->tau_sq.find(depth);
+    if (it == mesh->tau_sq.end()) return {0.0, 0.0};
+    double tau = it->second;
+
+    Vertex* a = parent_edge->vertex0;
+    Vertex* b = parent_edge->vertex1;
+    double ml = (a->height + b->height) / 2.0;
+
+    // Non-corner parents
+    std::vector<Vertex*> non_corner;
+    if (a->parent_edge != nullptr) non_corner.push_back(a);
+    if (b->parent_edge != nullptr) non_corner.push_back(b);
+
+    double delta_prior;
+    if (!non_corner.empty()) {
+        delta_prior = 0.0;
+        for (Vertex* v : non_corner) delta_prior += v->delta_pooled;
+        delta_prior /= non_corner.size();
+    } else {
+        auto md_it = mesh->mu_delta.find(depth);
+        delta_prior = (md_it != mesh->mu_delta.end()) ? md_it->second : 0.0;
+    }
+
+    double mu_v = ml + delta_prior;
+
+    double overlap_frac = compute_overlap_factor(a, b);
+    double s_v = 1.0 / std::max(1e-15, 1.0 - overlap_frac);
+
+    double sigma_prior;
+    std::vector<double> parent_sigmas;
+    for (Vertex* v : non_corner) {
+        if (v->sigma_pooled < 1e300) {
+            parent_sigmas.push_back(v->sigma_pooled);
+        }
+    }
+    if (!parent_sigmas.empty()) {
+        double avg_sigma = 0.0;
+        for (double s : parent_sigmas) avg_sigma += s;
+        avg_sigma /= parent_sigmas.size();
+        sigma_prior = tau + s_v * avg_sigma;
+    } else {
+        sigma_prior = tau;
+    }
+
+    double lv;
+    if (sigma_prior <= 0) {
+        lv = 1e12;
+    } else {
+        lv = 1.0 / sigma_prior;
+    }
+
+    return {lv, mu_v};
 }

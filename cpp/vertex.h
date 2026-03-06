@@ -30,6 +30,15 @@ struct Vertex {
     std::set<Vertex*> affected_vertices;
     int affected_points = 0;
 
+    // Empirical Bayes partial pooling fields
+    int depth = 0;
+    double sigma_sq = 1e300;       // data-only variance (1/xTx)
+    double delta_pooled = 0.0;     // height - mu_lin
+    double sigma_pooled = 1e300;   // posterior variance
+    double lambda_v = 0.0;        // prior precision (1/sigma_prior)
+    double prior_mean = 0.0;      // EB prior mean
+    std::set<Vertex*> prior_children;  // vertices on this vertex's edges (for prior propagation)
+
     Vertex() : _id(-1), x(0), y(0) {}
     Vertex(DecisionMesh* mesh, double x, double y, bool active = false,
            Edge* parent_edge = nullptr, bool real_vertex = true);
@@ -64,8 +73,14 @@ struct Vertex {
         double loss_reduction;
         std::set<Vertex*> affected;
         int n_points;
+        double xTx, xTr, rTr;  // sufficient statistics for EB
     };
     LocRegressResult loc_regress();
+
+    // Empirical Bayes helpers
+    double mu_lin() const;
+    double compute_overlap_factor(Vertex* a, Vertex* b) const;
+    std::pair<double, double> compute_eb_params(double xTx) const;
 
     int degree() const { return (int)edges.size(); }
 };

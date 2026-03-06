@@ -40,6 +40,7 @@ extern CascadeCounters g_counters;
 
 struct DecisionMesh {
     double max_aspect_ratio = 5.0;
+    bool use_eb = false;  // empirical Bayes regularization
 
     // Data: n rows, 2 columns for X, 1 column for values
     int n_points = 0;
@@ -61,8 +62,6 @@ struct DecisionMesh {
     std::set<Edge*> active_edges;
 
     // Loss heap: map from negative loss_reduction -> vertex
-    // We use a std::map<double, std::set<Vertex*>> for decrease-key support
-    // Or simpler: just track in vertices and scan. For performance, use a map.
     std::map<double, std::set<Vertex*>> loss_heap;
 
     // Outer geometry
@@ -74,9 +73,17 @@ struct DecisionMesh {
 
     std::mt19937 rng;
 
+    // Empirical Bayes state
+    std::map<int, double> tau_sq;       // depth -> tau_sq
+    std::map<int, double> mu_delta;     // depth -> population mean curvature
+    std::map<int, int> tau_sq_vertex_counts;  // depth -> count at last recomputation
+    int tau_sq_recompute_interval = 20;
+    int steps_since_tau_recompute = 0;
+
     DecisionMesh(const std::vector<double>& x_data,
                  const std::vector<double>& y_data,
-                 const std::vector<double>& z_data);
+                 const std::vector<double>& z_data,
+                 bool use_eb = false);
     ~DecisionMesh();
 
     // Factory methods (own the memory)
@@ -100,6 +107,10 @@ struct DecisionMesh {
     Face* random_face();
     void update_best_vertex(double random_prob = 0.0);
     TimingRecord update_best_vertex_timed(double random_prob, int iteration);
+
+    // Empirical Bayes
+    void recompute_tau_sq();
+    void maybe_recompute_tau_sq();
 
     double get_x(int i, int col) const { return X[i * 2 + col]; }
 
