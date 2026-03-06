@@ -52,6 +52,23 @@ class Vertex:
         self.edges: set[Edge] = set()
         self.neighbors: set[Vertex] = set()
 
+        # Empirical Bayes partial pooling fields
+        if parent_edge is not None:
+            self.depth = max(parent_edge.vertex0.depth, parent_edge.vertex1.depth) + 1
+        else:
+            self.depth = 0
+        self.prior_mean = 0.0
+        self.lambda_v = 0.0
+        self.sigma_sq = float('inf')
+        self.delta_pooled = 0.0
+        self.sigma_pooled = float('inf')
+        self.prior_children: set[Vertex] = set()
+
+        # Register with parent edge endpoints for prior propagation
+        if real_vertex and parent_edge is not None:
+            parent_edge.vertex0.prior_children.add(self)
+            parent_edge.vertex1.prior_children.add(self)
+
     @property
     def sid(self) -> str:
         return f"V{self._id:03d}"
@@ -146,20 +163,64 @@ class Vertex:
             return
         self.active = True
         self.height = self.new_height
+
+        # Set EB posterior fields before split (new midpoints need these during split)
+        if self.parent_edge is not None:
+            self.delta_pooled = self.height - self._mu_lin()
+            inv_sigma = (1.0 / self.sigma_sq if self.sigma_sq < float('inf') else 0.0)
+            xTx_reg = inv_sigma + self.lambda_v
+            self.sigma_pooled = 1.0 / xTx_reg if xTx_reg > 0 else float('inf')
+
         self.parent_edge.split()
-        for v in self.affected_vertices:
+
+        affected = set(self.affected_vertices)
+        affected.update(self.prior_children)
+        for v in affected:
             v.update_info()
         self.loss_reduction = 0
         self.mesh.loss_heap[self] = 0
 
     def update_info(self):
-        self.new_height, self.loss_reduction, self.affected_vertices, self.affected_points = self.loc_regress()
+        beta_data, loss_red_data, neighbors, n_points, xTx, xTr, rTr = self.loc_regress()
+        self.affected_vertices = neighbors
+        self.affected_points = n_points
+        self.sigma_sq = 1.0 / xTx if xTx > 0 else float('inf')
+
+        lambda_v, mu_v = self._compute_eb_params(xTx)
+        self.lambda_v = lambda_v
+
+        if lambda_v > 0 and xTx > 0:
+            xTx_reg = xTx + lambda_v
+            xTr_reg = xTr + lambda_v * mu_v
+            beta_reg = xTr_reg / xTx_reg
+
+            beta_orig = float(self.height)
+            orig_loss = (beta_orig * beta_orig * xTx
+                         - 2 * beta_orig * xTr + rTr
+                         + lambda_v * (beta_orig - mu_v) ** 2)
+            sse_post = rTr + lambda_v * mu_v * mu_v - xTr_reg * xTr_reg / xTx_reg
+
+            self.new_height = beta_reg
+            self.loss_reduction = max(0.0, orig_loss - sse_post)
+            self.sigma_pooled = 1.0 / xTx_reg
+            self.delta_pooled = beta_reg - self._mu_lin()
+        else:
+            self.new_height = beta_data
+            self.loss_reduction = loss_red_data
+            if self.parent_edge is not None and xTx > 0:
+                self.delta_pooled = beta_data - self._mu_lin()
+                self.sigma_pooled = self.sigma_sq
+
         if not self.disqualified:
             self.mesh.loss_heap[self] = -self.loss_reduction
 
     def update_height(self):
         self.height = self.new_height
-        for v in self.affected_vertices:
+        if self.parent_edge is not None:
+            self.delta_pooled = self.height - self._mu_lin()
+        affected = set(self.affected_vertices)
+        affected.update(self.prior_children)
+        for v in affected:
             v.update_info()
         self.loss_reduction = 0
         self.mesh.loss_heap[self] = 0
@@ -228,7 +289,7 @@ class Vertex:
             neighbors, faces = self.get_sim_faces()
 
         if not faces:
-            return float(self.height), 0.0, neighbors, 0
+            return float(self.height), 0.0, neighbors, 0, 0.0, 0.0, 0.0
 
         # 2) design matrix for those faces
         X, rows, col_key = self.build_design_matrix(faces)
@@ -255,19 +316,89 @@ class Vertex:
 
         # 7) optimal 1D least-squares for beta (self only)
         xTx = float(x @ x)
+        rTr = float(r @ r)
         if xTx > 0.0:
             xTr = float(x @ r)
             beta_opt = xTr / xTx
-            # SSE_post = ||r - x*beta_opt||^2 = r^Tr - (x^Tr)^2 / (x^Tx)
-            sse_post = float((r @ r) - (xTr * xTr) / xTx)
+            sse_post = rTr - (xTr * xTr) / xTx
         else:
-            # self's column has no support; nothing to fit
+            xTr = 0.0
             beta_opt = beta_orig
-            sse_post = float(r @ r)
+            sse_post = rTr
 
         loss_reduction = orig_loss - sse_post
 
-        return float(beta_opt), float(loss_reduction), neighbors, points_attached
+        return float(beta_opt), float(loss_reduction), neighbors, points_attached, xTx, xTr, rTr
+
+    # --- Empirical Bayes helpers ---
+
+    def _mu_lin(self):
+        if self.parent_edge is None:
+            return 0.0
+        return (self.parent_edge.vertex0.height + self.parent_edge.vertex1.height) / 2.0
+
+    def _compute_overlap_factor(self, a, b):
+        def faces_of(v):
+            out = set()
+            for e in v.edges:
+                for s in ('+', '-'):
+                    f = e.faces.get(s)
+                    if f is not None and v in f.vertices:
+                        out.add(f)
+            return out
+
+        faces_a = faces_of(a)
+        faces_b = faces_of(b)
+        shared = faces_a & faces_b
+
+        n_shared = sum(int(f.mask.sum()) for f in shared)
+        n_a = sum(int(f.mask.sum()) for f in faces_a)
+        n_b = sum(int(f.mask.sum()) for f in faces_b)
+
+        denom = n_a + n_b - n_shared
+        if denom <= 0:
+            return 0.0
+        return n_shared / denom
+
+    def _compute_eb_params(self, xTx):
+        if self.parent_edge is None or xTx <= 0:
+            return 0.0, 0.0
+
+        tau_sq_dict = self.mesh.tau_sq
+        if not tau_sq_dict or self.depth not in tau_sq_dict:
+            return 0.0, 0.0
+
+        tau_sq = tau_sq_dict[self.depth]
+
+        a = self.parent_edge.vertex0
+        b = self.parent_edge.vertex1
+        mu_lin = (a.height + b.height) / 2.0
+
+        non_corner_parents = [v for v in (a, b) if v.parent_edge is not None]
+        if non_corner_parents:
+            delta_prior = sum(v.delta_pooled for v in non_corner_parents) / len(non_corner_parents)
+        else:
+            delta_prior = self.mesh.mu_delta.get(self.depth, 0.0)
+
+        mu_v = mu_lin + delta_prior
+
+        overlap_frac = self._compute_overlap_factor(a, b)
+        s_v = 1.0 / max(1e-15, 1.0 - overlap_frac)
+
+        parent_sigmas = [v.sigma_pooled for v in non_corner_parents
+                         if v.sigma_pooled < float('inf')]
+        if parent_sigmas:
+            sigma_prior = tau_sq + s_v * sum(parent_sigmas) / len(parent_sigmas)
+        else:
+            sigma_prior = tau_sq
+
+        if sigma_prior <= 0:
+            lambda_v = 1e12
+        else:
+            lambda_v = 1.0 / sigma_prior
+
+        self.prior_mean = mu_v
+        return lambda_v, mu_v
 
     @property
     def degree(self) -> int:

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections import defaultdict
+
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -28,6 +30,13 @@ class DecisionMesh:
         self.midpoints = set()
         self.loss_heap = heapdict()
 
+        # Empirical Bayes partial pooling state
+        self.tau_sq = {}                        # depth -> tau_sq
+        self.mu_delta = {}                      # depth -> population mean curvature
+        self.tau_sq_vertex_counts = {}           # depth -> count at last recomputation
+        self.tau_sq_recompute_interval = 20
+        self.steps_since_tau_recompute = 0
+
         self.create_outer_vertices()
         self.create_outer_edges()
 
@@ -39,6 +48,13 @@ class DecisionMesh:
 
         for v in list(self.vertices):
             v.update_info()
+
+        # Bootstrap empirical Bayes: compute tau_sq from initial estimates,
+        # then re-update non-corner vertices with regularization
+        self.recompute_tau_sq()
+        for v in list(self.vertices):
+            if v.parent_edge is not None:
+                v.update_info()
 
     def _empty_mask(self) -> pd.Series:
         """Default factory for ownership: a fresh all-False mask aligned to data."""
@@ -150,6 +166,8 @@ class DecisionMesh:
         if not isinstance(rng, np.random.Generator):
             rng = np.random.default_rng(rng)
 
+        self.maybe_recompute_tau_sq()
+
         # --- exploration: use midpoint of longest edge in a weighted-random face
         if random > 0.0 and rng.random() < random:
             face = self.random_face(rng=rng)
@@ -169,6 +187,62 @@ class DecisionMesh:
             best.update_height()
         else:
             best.activate()
+
+    def recompute_tau_sq(self):
+        by_depth = defaultdict(list)
+        for v in self.vertices:
+            if v.parent_edge is None:
+                continue
+            if v.sigma_sq >= float('inf') or v.sigma_sq <= 0:
+                continue
+            by_depth[v.depth].append(v)
+
+        for d, verts in by_depth.items():
+            m = len(verts)
+            self.tau_sq_vertex_counts[d] = m
+
+            if m < 3:
+                continue
+
+            sum_w = sum(1.0 / v.sigma_sq for v in verts)
+            if sum_w <= 0:
+                continue
+            sum_wd = sum(v.delta_pooled / v.sigma_sq for v in verts)
+            mu_d = sum_wd / sum_w
+            self.mu_delta[d] = mu_d
+
+            chi_sq = sum((v.delta_pooled - mu_d) ** 2 / v.sigma_sq for v in verts)
+            tau_sq = max(0.0, (chi_sq - (m - 1)) / sum_w)
+            self.tau_sq[d] = tau_sq
+
+        # For depths with < 3 vertices, borrow from nearest depth
+        all_depths_with_tau = sorted(self.tau_sq.keys())
+        for d in sorted(by_depth.keys()):
+            if d not in self.tau_sq and all_depths_with_tau:
+                nearest = min(all_depths_with_tau, key=lambda d2: abs(d2 - d))
+                self.tau_sq[d] = self.tau_sq[nearest]
+                self.mu_delta.setdefault(d, self.mu_delta.get(nearest, 0.0))
+
+        self.steps_since_tau_recompute = 0
+
+    def maybe_recompute_tau_sq(self):
+        self.steps_since_tau_recompute += 1
+
+        if self.steps_since_tau_recompute >= self.tau_sq_recompute_interval:
+            self.recompute_tau_sq()
+            return
+
+        # Check if any depth has grown by 50%
+        by_depth = defaultdict(int)
+        for v in self.vertices:
+            if v.parent_edge is not None and v.sigma_sq < float('inf'):
+                by_depth[v.depth] += 1
+
+        for d, count in by_depth.items():
+            old_count = self.tau_sq_vertex_counts.get(d, 0)
+            if old_count > 0 and count >= old_count * 1.5:
+                self.recompute_tau_sq()
+                return
 
     def create_outer_vertices(self):
         self.xmin = self.X[:, 0].min()
