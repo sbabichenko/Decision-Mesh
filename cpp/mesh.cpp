@@ -358,6 +358,66 @@ void DecisionMesh::maybe_recompute_tau_sq() {
     }
 }
 
+// --- Prediction: walk tree to leaf face, then affine interpolate ---
+
+double DecisionMesh::predict(double px, double py) const {
+    // Walk the binary tree from root to leaf: O(depth) = O(log faces)
+    const TreeNode* node = root;
+    while (node->has_split) {
+        double val = node->split_normal[0] * px + node->split_normal[1] * py;
+        node = (val >= node->split_intercept) ? node->p : node->m;
+    }
+
+    // node->face is the leaf face containing (px, py)
+    Face* f = node->face;
+    if (!f) return 0.0;
+
+    Vertex* v0 = f->vertices[0];
+    Vertex* v1 = f->vertices[1];
+    Vertex* v2 = f->vertices[2];
+    double h0 = v0->height, h1 = v1->height, h2 = v2->height;
+
+    // Compute barycentric coordinates for the query point
+    double ax = v1->x - v0->x, ay = v1->y - v0->y;
+    double bx = v2->x - v0->x, by = v2->y - v0->y;
+    double det = ax * by - ay * bx;
+
+    if (std::abs(det) < 1e-14) {
+        // Degenerate triangle: return average height
+        return (h0 + h1 + h2) / 3.0;
+    }
+
+    double inv = 1.0 / det;
+    double dpx = px - v0->x, dpy = py - v0->y;
+    double u = (dpx * by - dpy * bx) * inv;  // weight for v1
+    double v = (ax * dpy - ay * dpx) * inv;   // weight for v2
+    double w = 1.0 - u - v;                   // weight for v0
+
+    // Clamp barycentric coords to [0,1] to avoid extrapolation on thin triangles
+    // when the query point falls slightly outside due to numerical issues
+    double cw = std::max(0.0, std::min(1.0, w));
+    double cu = std::max(0.0, std::min(1.0, u));
+    double cv = std::max(0.0, std::min(1.0, v));
+    double total = cw + cu + cv;
+    if (total > 0) {
+        cw /= total; cu /= total; cv /= total;
+    } else {
+        cw = cu = cv = 1.0 / 3.0;
+    }
+
+    return cw * h0 + cu * h1 + cv * h2;
+}
+
+std::vector<double> DecisionMesh::predict_batch(const std::vector<double>& px,
+                                                 const std::vector<double>& py) const {
+    int n = (int)px.size();
+    std::vector<double> result(n);
+    for (int i = 0; i < n; ++i) {
+        result[i] = predict(px[i], py[i]);
+    }
+    return result;
+}
+
 void DecisionMesh::create_outer_vertices() {
     xmin = X[0]; xmax = X[0];
     ymin = X[1]; ymax = X[1];

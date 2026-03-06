@@ -114,6 +114,12 @@ struct DecisionMesh {
 
     double get_x(int i, int col) const { return X[i * 2 + col]; }
 
+    // Prediction: walk tree to leaf in O(log n), then affine interpolate
+    double predict(double px, double py) const;
+    // Batch prediction
+    std::vector<double> predict_batch(const std::vector<double>& px,
+                                      const std::vector<double>& py) const;
+
     // Export mesh to SVG (simple visualization)
     void write_svg(const std::string& filename, double width = 800, double height = 800) const;
 };
