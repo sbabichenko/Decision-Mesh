@@ -112,13 +112,15 @@ int main(int argc, char** argv) {
     printf("Mesh built in %.1fs.\n", build_time);
 
     printf("Refining for up to %d seconds...\n", time_limit_sec);
+    std::vector<TimingRecord> timing_records;
     auto start = std::clock();
     int iters = 0;
     while (true) {
         double elapsed = (double)(std::clock() - start) / CLOCKS_PER_SEC;
         if (elapsed >= time_limit_sec) break;
 
-        mesh.update_best_vertex(0.1);
+        auto rec = mesh.update_best_vertex_timed(0.1, iters);
+        timing_records.push_back(rec);
         iters++;
 
         if (iters % 50 == 0) {
@@ -130,6 +132,26 @@ int main(int argc, char** argv) {
     double total = (double)(std::clock() - start) / CLOCKS_PER_SEC;
     printf("\nDone: %d refinements in %.1fs (%.0fms/ref)\n",
            iters, total, total / iters * 1000);
+
+    // Write timing CSV
+    std::string timing_csv = output_svg;
+    auto dot = timing_csv.rfind('.');
+    if (dot != std::string::npos) timing_csv = timing_csv.substr(0, dot);
+    timing_csv += "_timing.csv";
+    {
+        std::ofstream csv(timing_csv);
+        csv << "iteration,find_best_us,split_us,update_info_us,total_us,active_faces,n_vertices\n";
+        for (auto& r : timing_records) {
+            csv << r.iteration << ","
+                << r.find_best_us << ","
+                << r.split_us << ","
+                << r.update_info_us << ","
+                << r.total_us << ","
+                << r.active_faces << ","
+                << r.n_vertices << "\n";
+        }
+        printf("Timing data written to %s\n", timing_csv.c_str());
+    }
 
     printf("Writing SVG to %s...\n", output_svg.c_str());
     mesh.write_svg(output_svg);

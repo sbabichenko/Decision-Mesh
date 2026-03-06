@@ -4,6 +4,7 @@
 #include "edge.h"
 #include "face.h"
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <fstream>
 #include <sstream>
@@ -175,6 +176,81 @@ void DecisionMesh::update_best_vertex(double random_prob) {
     } else {
         best->activate();
     }
+}
+
+TimingRecord DecisionMesh::update_best_vertex_timed(double random_prob, int iteration) {
+    using clock = std::chrono::high_resolution_clock;
+    TimingRecord rec{};
+    rec.iteration = iteration;
+
+    // Phase 1: Find best vertex
+    auto t0 = clock::now();
+    Vertex* best = nullptr;
+
+    std::uniform_real_distribution<double> dist(0.0, 1.0);
+    if (random_prob > 0.0 && dist(rng) < random_prob) {
+        Face* face = random_face();
+        if (face) {
+            double max_len = 0;
+            Edge* longest = nullptr;
+            for (int i = 0; i < 3; ++i) {
+                if (face->edges[i]->length > max_len) {
+                    max_len = face->edges[i]->length;
+                    longest = face->edges[i];
+                }
+            }
+            if (longest) best = longest->midpoint;
+        }
+    } else {
+        auto [v, _] = heap_peek();
+        best = v;
+    }
+    auto t1 = clock::now();
+    rec.find_best_us = std::chrono::duration<double, std::micro>(t1 - t0).count();
+
+    if (!best) {
+        rec.total_us = rec.find_best_us;
+        rec.active_faces = (int)active_faces.size();
+        rec.n_vertices = (int)vertices.size();
+        return rec;
+    }
+
+    // Phase 2: Split/activate
+    auto t2 = clock::now();
+    if (best->active) {
+        // update_height: sets height, then calls update_info on affected
+        best->height = best->new_height;
+        // We split the "split" part (just height assignment) from update_info propagation
+        auto t2b = clock::now();
+        for (Vertex* v : best->affected_vertices) {
+            v->update_info();
+        }
+        best->loss_reduction = 0;
+        heap_set(best, 0);
+        auto t3 = clock::now();
+        rec.split_us = std::chrono::duration<double, std::micro>(t2b - t2).count();
+        rec.update_info_us = std::chrono::duration<double, std::micro>(t3 - t2b).count();
+    } else {
+        // activate: set height, split parent edge (creates new faces), then update_info
+        best->active = true;
+        best->height = best->new_height;
+        best->parent_edge->split();
+        auto t2b = clock::now();
+        for (Vertex* v : best->affected_vertices) {
+            v->update_info();
+        }
+        best->loss_reduction = 0;
+        heap_set(best, 0);
+        auto t3 = clock::now();
+        rec.split_us = std::chrono::duration<double, std::micro>(t2b - t2).count();
+        rec.update_info_us = std::chrono::duration<double, std::micro>(t3 - t2b).count();
+    }
+
+    auto tend = clock::now();
+    rec.total_us = std::chrono::duration<double, std::micro>(tend - t0).count();
+    rec.active_faces = (int)active_faces.size();
+    rec.n_vertices = (int)vertices.size();
+    return rec;
 }
 
 void DecisionMesh::create_outer_vertices() {

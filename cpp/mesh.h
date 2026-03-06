@@ -10,6 +10,16 @@ struct Vertex;
 struct Edge;
 struct Face;
 
+struct TimingRecord {
+    int iteration;
+    double find_best_us;   // microseconds spent finding best vertex
+    double split_us;       // microseconds spent splitting/activating
+    double update_info_us; // microseconds spent in update_info propagation
+    double total_us;       // total for this refinement
+    int active_faces;
+    int n_vertices;
+};
+
 struct DecisionMesh {
     double max_aspect_ratio = 5.0;
 
@@ -71,6 +81,7 @@ struct DecisionMesh {
 
     Face* random_face();
     void update_best_vertex(double random_prob = 0.0);
+    TimingRecord update_best_vertex_timed(double random_prob, int iteration);
 
     double get_x(int i, int col) const { return X[i * 2 + col]; }
 
