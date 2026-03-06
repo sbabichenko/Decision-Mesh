@@ -73,9 +73,9 @@ struct DecisionMesh {
 
     std::mt19937 rng;
 
-    // Empirical Bayes state
-    std::map<int, double> tau_sq;       // depth -> tau_sq
-    std::map<int, double> mu_delta;     // depth -> population mean curvature
+    // Wavelet spike-and-slab EB state
+    std::map<int, double> tau_sq;       // depth -> slab variance
+    std::map<int, double> pi_d;         // depth -> signal probability
     std::map<int, int> tau_sq_vertex_counts;  // depth -> count at last recomputation
     int tau_sq_recompute_interval = 20;
     int steps_since_tau_recompute = 0;
