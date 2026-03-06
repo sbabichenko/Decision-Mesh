@@ -16,6 +16,8 @@ struct Vertex {
     double height = 0.0;
     double new_height = 0.0;
     double loss_reduction = 0.0;
+    double heap_key = 0.0;       // current key in loss_heap (for O(log n) removal)
+    bool in_heap = false;        // whether this vertex is in the heap
     bool active = false;
     bool disqualified = false;
     bool real_vertex = true;

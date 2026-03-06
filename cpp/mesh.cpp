@@ -94,21 +94,33 @@ Face* DecisionMesh::make_face(Edge* e0, Edge* e1, Edge* e2,
 // --- Heap operations using std::map<double, std::set<Vertex*>> ---
 
 void DecisionMesh::heap_set(Vertex* v, double neg_loss) {
-    // Remove old entry if exists
-    heap_pop(v);
+    // O(log n) removal of old entry using cached key
+    if (v->in_heap) {
+        auto it = loss_heap.find(v->heap_key);
+        if (it != loss_heap.end()) {
+            it->second.erase(v);
+            if (it->second.empty()) {
+                loss_heap.erase(it);
+            }
+        }
+        v->in_heap = false;
+    }
+    // O(log n) insertion at new key
     loss_heap[neg_loss].insert(v);
+    v->heap_key = neg_loss;
+    v->in_heap = true;
 }
 
 void DecisionMesh::heap_pop(Vertex* v) {
-    // Linear scan to find and remove - could be optimized
-    for (auto it = loss_heap.begin(); it != loss_heap.end(); ) {
+    if (!v->in_heap) return;
+    auto it = loss_heap.find(v->heap_key);
+    if (it != loss_heap.end()) {
         it->second.erase(v);
         if (it->second.empty()) {
-            it = loss_heap.erase(it);
-        } else {
-            ++it;
+            loss_heap.erase(it);
         }
     }
+    v->in_heap = false;
 }
 
 std::pair<Vertex*, double> DecisionMesh::heap_peek() const {
