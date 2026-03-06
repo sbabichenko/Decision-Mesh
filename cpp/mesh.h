@@ -18,7 +18,25 @@ struct TimingRecord {
     double total_us;       // total for this refinement
     int active_faces;
     int n_vertices;
+    // Diagnostic counters for understanding cascade behavior
+    int cascade_activations;  // how many recursive vertex activations (completions)
+    int faces_created;        // faces created during this refinement
+    int edges_created;        // edges created during this refinement
+    int add_face_calls;       // Edge::add_face calls (each does coord computation)
+    int update_info_calls;    // Vertex::update_info calls
 };
+
+// Thread-local counters for cascade instrumentation
+struct CascadeCounters {
+    int cascade_activations = 0;
+    int faces_created = 0;
+    int edges_created = 0;
+    int add_face_calls = 0;
+    int update_info_calls = 0;
+};
+
+// Global counters (single-threaded, so this is fine)
+extern CascadeCounters g_counters;
 
 struct DecisionMesh {
     double max_aspect_ratio = 5.0;

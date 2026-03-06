@@ -11,6 +11,8 @@
 #include <numeric>
 #include <limits>
 
+CascadeCounters g_counters;
+
 DecisionMesh::DecisionMesh(const std::vector<double>& x_data,
                            const std::vector<double>& y_data,
                            const std::vector<double>& z_data)
@@ -74,6 +76,7 @@ Vertex* DecisionMesh::make_vertex(double x, double y, bool active,
 }
 
 Edge* DecisionMesh::make_edge(Vertex* v0, Vertex* v1, bool active) {
+    g_counters.edges_created++;
     auto* e = new Edge(this, v0, v1, active);
     all_edges.push_back(e);
     return e;
@@ -82,6 +85,7 @@ Edge* DecisionMesh::make_edge(Vertex* v0, Vertex* v1, bool active) {
 Face* DecisionMesh::make_face(Edge* e0, Edge* e1, Edge* e2,
                                const std::vector<bool>& mask, bool active,
                                const std::string& path, bool skip_coords) {
+    g_counters.faces_created++;
     auto* f = new Face(this, e0, e1, e2, mask, active, path, skip_coords);
     all_faces.push_back(f);
     return f;
@@ -212,7 +216,8 @@ TimingRecord DecisionMesh::update_best_vertex_timed(double random_prob, int iter
         return rec;
     }
 
-    // Phase 2: Split/activate
+    // Phase 2: Split/activate — reset cascade counters
+    g_counters = CascadeCounters{};
     auto t2 = clock::now();
     if (best->active) {
         // update_height: sets height, then calls update_info on affected
@@ -247,6 +252,11 @@ TimingRecord DecisionMesh::update_best_vertex_timed(double random_prob, int iter
     rec.total_us = std::chrono::duration<double, std::micro>(tend - t0).count();
     rec.active_faces = (int)active_faces.size();
     rec.n_vertices = (int)vertices.size();
+    rec.cascade_activations = g_counters.cascade_activations;
+    rec.faces_created = g_counters.faces_created;
+    rec.edges_created = g_counters.edges_created;
+    rec.add_face_calls = g_counters.add_face_calls;
+    rec.update_info_calls = g_counters.update_info_calls;
     return rec;
 }
 

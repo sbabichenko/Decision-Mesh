@@ -22,11 +22,17 @@ def main():
     for col in ["find_best_us", "split_us", "update_info_us", "total_us"]:
         df[col.replace("_us", "_ms")] = df[col] / 1000.0
 
-    # --- Plot 1: Stacked area of time per refinement ---
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    has_cascade = "cascade_activations" in df.columns
 
-    ax = axes[0, 0]
+    if has_cascade:
+        fig, axes = plt.subplots(3, 2, figsize=(14, 15))
+    else:
+        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+
     window = max(1, len(df) // 100)
+
+    # --- Plot 1: Stacked area of time per refinement ---
+    ax = axes[0, 0]
     find_smooth = df["find_best_ms"].rolling(window, min_periods=1).mean()
     split_smooth = df["split_ms"].rolling(window, min_periods=1).mean()
     update_smooth = df["update_info_ms"].rolling(window, min_periods=1).mean()
@@ -64,7 +70,7 @@ def main():
     ax.set_ylim(0, 100)
     ax.legend(loc="upper left")
 
-    # --- Plot 3: Total time per refinement vs mesh size ---
+    # --- Plot 3: Total time vs mesh size ---
     ax = axes[1, 0]
     ax.scatter(df["active_faces"], df["total_us"] / 1000, s=3, alpha=0.3, c="#673AB7")
     ax.set_xlabel("Active faces")
@@ -80,6 +86,37 @@ def main():
     ax.set_ylabel("Time (ms)")
     ax.set_title("Per-phase cost vs mesh complexity")
     ax.legend(markerscale=5)
+
+    if has_cascade:
+        # --- Plot 5: Cascade depth and object counts vs iteration ---
+        ax = axes[2, 0]
+        cascade_smooth = df["cascade_activations"].rolling(window, min_periods=1).mean()
+        ax.plot(df["iteration"], cascade_smooth, color="#E91E63", linewidth=1, label="Cascade activations")
+        ax.set_xlabel("Refinement iteration")
+        ax.set_ylabel("Count (smoothed)")
+        ax.set_title("Completion cascade depth per refinement")
+        ax.legend()
+
+        ax2 = ax.twinx()
+        faces_smooth = df["faces_created"].rolling(window, min_periods=1).mean()
+        add_face_smooth = df["add_face_calls"].rolling(window, min_periods=1).mean()
+        ax2.plot(df["iteration"], faces_smooth, color="#9C27B0", linewidth=1, alpha=0.7, label="Faces created")
+        ax2.plot(df["iteration"], add_face_smooth, color="#FF5722", linewidth=1, alpha=0.7, label="add_face calls")
+        ax2.set_ylabel("Objects created")
+        ax2.legend(loc="upper right")
+
+        # --- Plot 6: Split time vs cascade depth ---
+        ax = axes[2, 1]
+        ax.scatter(df["cascade_activations"], df["split_ms"], s=5, alpha=0.3, c="#E91E63")
+        ax.set_xlabel("Cascade activations (completion depth)")
+        ax.set_ylabel("Split time (ms)")
+        ax.set_title("Split cost driven by cascade depth")
+
+        # Add text annotation with correlation
+        corr = df["cascade_activations"].corr(df["split_ms"])
+        ax.text(0.05, 0.95, f"r = {corr:.3f}", transform=ax.transAxes,
+                fontsize=12, verticalalignment='top',
+                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
 
     plt.tight_layout()
     out_path = f"{prefix}_timing_breakdown.png"

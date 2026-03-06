@@ -3,6 +3,8 @@
 #include "vertex.h"
 #include "face.h"
 #include <cmath>
+
+extern CascadeCounters g_counters;
 #include <algorithm>
 
 int Edge::_seq = 0;
@@ -83,6 +85,7 @@ Vertex* Edge::other_vertex(Vertex* v) const {
 }
 
 void Edge::add_face(Face* face) {
+    g_counters.add_face_calls++;
     // Find opposing vertex
     int idx = -1;
     for (int i = 0; i < 3; ++i) {

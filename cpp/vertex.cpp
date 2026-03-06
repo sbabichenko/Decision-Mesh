@@ -7,6 +7,8 @@
 #include <vector>
 #include <algorithm>
 
+extern CascadeCounters g_counters;
+
 int Vertex::_seq = 0;
 
 Vertex::Vertex(DecisionMesh* mesh, double x, double y, bool active,
@@ -44,6 +46,7 @@ void Vertex::remove_edge(Edge* e) {
 
 void Vertex::activate() {
     if (active) return;
+    g_counters.cascade_activations++;
     active = true;
     height = new_height;
     parent_edge->split();
@@ -55,6 +58,7 @@ void Vertex::activate() {
 }
 
 void Vertex::update_info() {
+    g_counters.update_info_calls++;
     auto result = loc_regress();
     new_height = result.beta_opt;
     loss_reduction = result.loss_reduction;

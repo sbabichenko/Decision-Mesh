@@ -140,7 +140,8 @@ int main(int argc, char** argv) {
     timing_csv += "_timing.csv";
     {
         std::ofstream csv(timing_csv);
-        csv << "iteration,find_best_us,split_us,update_info_us,total_us,active_faces,n_vertices\n";
+        csv << "iteration,find_best_us,split_us,update_info_us,total_us,active_faces,n_vertices,"
+            << "cascade_activations,faces_created,edges_created,add_face_calls,update_info_calls\n";
         for (auto& r : timing_records) {
             csv << r.iteration << ","
                 << r.find_best_us << ","
@@ -148,7 +149,12 @@ int main(int argc, char** argv) {
                 << r.update_info_us << ","
                 << r.total_us << ","
                 << r.active_faces << ","
-                << r.n_vertices << "\n";
+                << r.n_vertices << ","
+                << r.cascade_activations << ","
+                << r.faces_created << ","
+                << r.edges_created << ","
+                << r.add_face_calls << ","
+                << r.update_info_calls << "\n";
         }
         printf("Timing data written to %s\n", timing_csv.c_str());
     }
