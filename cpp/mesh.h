@@ -122,4 +122,7 @@ struct DecisionMesh {
 
     // Export mesh to SVG (simple visualization)
     void write_svg(const std::string& filename, double width = 800, double height = 800) const;
+
+    // Export mesh data for Python plotting (vertices + triangles)
+    void write_mesh_csv(const std::string& prefix) const;
 };

@@ -208,7 +208,7 @@ int main(int argc, char** argv) {
            "Train MSE", "Test MSE", "Pred (us/pt)");
     printf("----------------------------------------------------------------------------------------------------\n");
 
-    auto run_benchmark = [&](const char* label, bool use_eb) {
+    auto run_benchmark = [&](const char* label, bool use_eb, const std::string& prefix) {
         Vertex::_seq = 0; Edge::_seq = 0; Face::_seq = 0; TreeNode::_seq = 0;
 
         auto t0 = std::clock();
@@ -243,10 +243,15 @@ int main(int argc, char** argv) {
                label, build_time, refine_time,
                iters, (int)mesh.active_faces.size(),
                train_mse, test_mse, pred_us_per_pt);
+
+        // Write mesh data for visualization
+        mesh.write_mesh_csv(prefix);
+        fprintf(stderr, "  Wrote %s_vertices.csv, %s_triangles.csv\n",
+                prefix.c_str(), prefix.c_str());
     };
 
-    run_benchmark("No regularization", false);
-    run_benchmark("Empirical Bayes", true);
+    run_benchmark("No regularization", false, "mesh_noreg");
+    run_benchmark("Empirical Bayes", true, "mesh_eb");
 
     printf("\nDone.\n");
     return 0;

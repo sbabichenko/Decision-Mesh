@@ -498,3 +498,32 @@ void DecisionMesh::write_svg(const std::string& filename, double w, double h) co
     out << "</svg>\n";
     out.close();
 }
+
+void DecisionMesh::write_mesh_csv(const std::string& prefix) const {
+    // Assign stable IDs to vertices
+    std::map<const Vertex*, int> vid;
+    int next_id = 0;
+    for (const Vertex* v : vertices) {
+        vid[v] = next_id++;
+    }
+
+    // Write vertices: id, x, y, height
+    {
+        std::ofstream out(prefix + "_vertices.csv");
+        out << "id,x,y,height\n";
+        for (const Vertex* v : vertices) {
+            out << vid[v] << "," << v->x << "," << v->y << "," << v->height << "\n";
+        }
+    }
+
+    // Write triangles: v0, v1, v2 (vertex ids)
+    {
+        std::ofstream out(prefix + "_triangles.csv");
+        out << "v0,v1,v2\n";
+        for (const Face* f : active_faces) {
+            out << vid[f->vertices[0]] << ","
+                << vid[f->vertices[1]] << ","
+                << vid[f->vertices[2]] << "\n";
+        }
+    }
+}
