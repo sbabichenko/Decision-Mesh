@@ -81,8 +81,8 @@ Edge* DecisionMesh::make_edge(Vertex* v0, Vertex* v1, bool active) {
 
 Face* DecisionMesh::make_face(Edge* e0, Edge* e1, Edge* e2,
                                const std::vector<bool>& mask, bool active,
-                               const std::string& path) {
-    auto* f = new Face(this, e0, e1, e2, mask, active, path);
+                               const std::string& path, bool skip_coords) {
+    auto* f = new Face(this, e0, e1, e2, mask, active, path, skip_coords);
     all_faces.push_back(f);
     return f;
 }
@@ -121,10 +121,7 @@ Face* DecisionMesh::random_face() {
     std::vector<double> weights(faces.size());
     for (size_t i = 0; i < faces.size(); ++i) {
         double a = faces[i]->area();
-        int count = 0;
-        for (int j = 0; j < n_points; ++j) {
-            if (faces[i]->mask[j]) ++count;
-        }
+        int count = faces[i]->n_covered;
         weights[i] = (a > 0 && std::isfinite(a)) ? a * count : 0.0;
     }
 

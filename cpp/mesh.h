@@ -68,7 +68,7 @@ struct DecisionMesh {
     Edge* make_edge(Vertex* v0, Vertex* v1, bool active);
     Face* make_face(Edge* e0, Edge* e1, Edge* e2,
                     const std::vector<bool>& mask, bool active = true,
-                    const std::string& path = "");
+                    const std::string& path = "", bool skip_coords = false);
 
     // Heap operations
     void heap_set(Vertex* v, double neg_loss);

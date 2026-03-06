@@ -160,110 +160,66 @@ Vertex::LocRegressResult Vertex::loc_regress() {
         return res;
     }
 
-    // Collect all vertices from all faces
-    std::set<Vertex*> all_verts;
-    for (Face* f : fr.faces) {
-        for (int i = 0; i < 3; ++i)
-            all_verts.insert(f->vertices[i]);
-    }
+    // Use per-face sufficient statistics to compute 1D least squares
+    // without iterating over individual data points.
+    //
+    // For vertex "self" at index si in face f:
+    //   residual_r = y_r - Σ_{j≠si} w_jr * h_j
+    //   x_self_r   = w_{si,r}
+    //
+    // xTx += f.S_ww[si][si]
+    // xTr += f.S_wy[si] - Σ_{j≠si} h_j * f.S_ww[si][j]
+    // rTr += f.S_yy - 2*Σ_{j≠si} h_j*f.S_wy[j]
+    //        + Σ_{j≠si} Σ_{k≠si} h_j*h_k*f.S_ww[j][k]
 
-    // Map vertices to column indices
-    std::map<Vertex*, int> col_key;
-    int col_idx = 0;
-    for (Vertex* v : all_verts) {
-        col_key[v] = col_idx++;
-    }
-    int n_cols = (int)all_verts.size();
+    double xTx = 0.0, xTr = 0.0, rTr = 0.0;
+    int total_points = 0;
 
-    // Build mask union and design matrix
-    // First pass: figure out which global data rows are covered
-    std::vector<bool> covered(mesh->n_points, false);
     for (Face* f : fr.faces) {
-        for (int i = 0; i < mesh->n_points; ++i) {
-            if (f->mask[i]) covered[i] = true;
+        // Find which vertex index in this face is "self"
+        int si = -1;
+        for (int i = 0; i < 3; ++i) {
+            if (f->vertices[i] == this) { si = i; break; }
         }
-    }
+        if (si < 0 || f->n_covered == 0) continue;
 
-    // Count covered rows
-    std::vector<int> row_indices;
-    for (int i = 0; i < mesh->n_points; ++i) {
-        if (covered[i]) row_indices.push_back(i);
-    }
-    int n_rows = (int)row_indices.size();
-    if (n_rows == 0) return res;
+        total_points += f->n_covered;
 
-    // Map global index -> local row index
-    std::map<int, int> row_map;
-    for (int r = 0; r < n_rows; ++r) {
-        row_map[row_indices[r]] = r;
-    }
+        // Gather neighbor heights for this face
+        double h[3];
+        for (int i = 0; i < 3; ++i)
+            h[i] = f->vertices[i]->height;
 
-    // Build design matrix X (n_rows x n_cols), initialized to 0
-    std::vector<double> X_mat(n_rows * n_cols, 0.0);
+        xTx += f->S_ww[si][si];
 
-    for (Face* f : fr.faces) {
-        for (size_t ci = 0; ci < f->coords_indices.size(); ++ci) {
-            int gi = f->coords_indices[ci];
-            auto it = row_map.find(gi);
-            if (it == row_map.end()) continue;
-            int r = it->second;
-            for (int vi = 0; vi < 3; ++vi) {
-                int c = col_key[f->vertices[vi]];
-                X_mat[r * n_cols + c] = f->coords_weights[ci][vi];
+        // xTr contribution
+        double xTr_face = f->S_wy[si];
+        for (int j = 0; j < 3; ++j) {
+            if (j == si) continue;
+            xTr_face -= h[j] * f->S_ww[si][j];
+        }
+        xTr += xTr_face;
+
+        // rTr contribution: ||y - Σ_{j≠si} w_j h_j||²
+        double rTr_face = f->S_yy;
+        for (int j = 0; j < 3; ++j) {
+            if (j == si) continue;
+            rTr_face -= 2.0 * h[j] * f->S_wy[j];
+            for (int k = 0; k < 3; ++k) {
+                if (k == si) continue;
+                rTr_face += h[j] * h[k] * f->S_ww[j][k];
             }
         }
+        rTr += rTr_face;
     }
 
-    // Build y vector
-    std::vector<double> y(n_rows);
-    for (int r = 0; r < n_rows; ++r) {
-        y[r] = mesh->values[row_indices[r]];
-    }
-
-    // Self column index
-    int self_col = col_key[this];
-
-    // Correction from neighbors
-    std::vector<double> correction(n_rows, 0.0);
-    for (auto& [v, c] : col_key) {
-        if (v == this) continue;
-        if (fr.neighbors.count(v) == 0 && v != this) {
-            // This is a vertex from faces but not a neighbor
-        }
-        double h = v->height;
-        for (int r = 0; r < n_rows; ++r) {
-            correction[r] += X_mat[r * n_cols + c] * h;
-        }
-    }
-
-    // Extract self column
-    std::vector<double> x_self(n_rows);
-    for (int r = 0; r < n_rows; ++r) {
-        x_self[r] = X_mat[r * n_cols + self_col];
-    }
-
-    // Residual r = y - correction
-    std::vector<double> r(n_rows);
-    for (int i = 0; i < n_rows; ++i) {
-        r[i] = y[i] - correction[i];
-    }
+    if (total_points == 0) return res;
 
     // Original loss with current height
     double beta_orig = height;
-    double orig_loss = 0.0;
-    for (int i = 0; i < n_rows; ++i) {
-        double diff = r[i] - x_self[i] * beta_orig;
-        orig_loss += diff * diff;
-    }
+    double orig_loss = rTr - 2.0 * beta_orig * xTr + beta_orig * beta_orig * xTx;
 
     // Optimal 1D least squares
-    double xTx = 0.0, xTr = 0.0, rTr = 0.0;
-    for (int i = 0; i < n_rows; ++i) {
-        xTx += x_self[i] * x_self[i];
-        xTr += x_self[i] * r[i];
-        rTr += r[i] * r[i];
-    }
-
     double beta_opt, sse_post;
     if (xTx > 0.0) {
         beta_opt = xTr / xTx;
@@ -275,6 +231,6 @@ Vertex::LocRegressResult Vertex::loc_regress() {
 
     res.beta_opt = beta_opt;
     res.loss_reduction = orig_loss - sse_post;
-    res.n_points = n_rows;
+    res.n_points = total_points;
     return res;
 }

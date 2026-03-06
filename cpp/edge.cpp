@@ -108,36 +108,41 @@ void Edge::add_face(Face* face) {
     Edge* edge0 = face->edges[idx_v1];
     Edge* edge1 = face->edges[idx_v0];
 
-    // Build mask split using the chord's half-plane
+    // Split parent face's points by chord half-plane (iterate only covered points)
     Edge* chord = sub_edges[sub_idx];
-    std::vector<bool> chord_mask(mesh->n_points, false);
-    for (int i = 0; i < mesh->n_points; ++i) {
+    std::vector<int> indices0, indices1;
+    indices0.reserve(face->coords_indices.size());
+    indices1.reserve(face->coords_indices.size());
+
+    for (int i : face->coords_indices) {
         double val = chord->normal[0] * mesh->get_x(i, 0) +
                      chord->normal[1] * mesh->get_x(i, 1);
-        chord_mask[i] = (val >= chord->intercept);
+        bool on_plus = (val >= chord->intercept);
+        if (face_type == '+') {
+            if (on_plus) indices0.push_back(i);
+            else         indices1.push_back(i);
+        } else {
+            if (!on_plus) indices0.push_back(i);
+            else          indices1.push_back(i);
+        }
     }
 
-    std::vector<bool> mask0(mesh->n_points), mask1(mesh->n_points);
     std::string path0, path1;
-
     if (face_type == '+') {
-        for (int i = 0; i < mesh->n_points; ++i) {
-            mask0[i] = chord_mask[i] && face->mask[i];
-            mask1[i] = !chord_mask[i] && face->mask[i];
-        }
         path0 = face->path + '+';
         path1 = face->path + '-';
     } else {
-        for (int i = 0; i < mesh->n_points; ++i) {
-            mask0[i] = !chord_mask[i] && face->mask[i];
-            mask1[i] = chord_mask[i] && face->mask[i];
-        }
         path0 = face->path + '-';
         path1 = face->path + '+';
     }
 
-    Face* face0 = mesh->make_face(edge0, sub_edges[0], sub_edges[sub_idx], mask0, false, path0);
-    Face* face1 = mesh->make_face(edge1, sub_edges[sub_idx], sub_edges[1], mask1, false, path1);
+    // Create child faces — skip coords & mask allocation, use fast index path
+    std::vector<bool> empty_mask;
+    Face* face0 = mesh->make_face(edge0, sub_edges[0], sub_edges[sub_idx], empty_mask, false, path0, true);
+    face0->update_coords_from_indices(indices0);
+
+    Face* face1 = mesh->make_face(edge1, sub_edges[sub_idx], sub_edges[1], empty_mask, false, path1, true);
+    face1->update_coords_from_indices(indices1);
 
     SubDivision sd;
     sd.e = chord;
