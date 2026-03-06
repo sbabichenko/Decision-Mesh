@@ -159,29 +159,8 @@ Face* DecisionMesh::random_face() {
     return faces.back();
 }
 
-void DecisionMesh::update_best_vertex(double random_prob) {
-    Vertex* best = nullptr;
-
-    std::uniform_real_distribution<double> dist(0.0, 1.0);
-    if (random_prob > 0.0 && dist(rng) < random_prob) {
-        Face* face = random_face();
-        if (!face) return;
-
-        // Pick longest edge
-        double max_len = 0;
-        Edge* longest = nullptr;
-        for (int i = 0; i < 3; ++i) {
-            if (face->edges[i]->length > max_len) {
-                max_len = face->edges[i]->length;
-                longest = face->edges[i];
-            }
-        }
-        if (longest) best = longest->midpoint;
-    } else {
-        auto [v, _] = heap_peek();
-        best = v;
-    }
-
+void DecisionMesh::update_best_vertex(double) {
+    auto [best, _] = heap_peek();
     if (!best) return;
 
     if (best->active) {
@@ -196,28 +175,9 @@ TimingRecord DecisionMesh::update_best_vertex_timed(double random_prob, int iter
     TimingRecord rec{};
     rec.iteration = iteration;
 
-    // Phase 1: Find best vertex
+    // Phase 1: Find best vertex (heap peek is O(1))
     auto t0 = clock::now();
-    Vertex* best = nullptr;
-
-    std::uniform_real_distribution<double> dist(0.0, 1.0);
-    if (random_prob > 0.0 && dist(rng) < random_prob) {
-        Face* face = random_face();
-        if (face) {
-            double max_len = 0;
-            Edge* longest = nullptr;
-            for (int i = 0; i < 3; ++i) {
-                if (face->edges[i]->length > max_len) {
-                    max_len = face->edges[i]->length;
-                    longest = face->edges[i];
-                }
-            }
-            if (longest) best = longest->midpoint;
-        }
-    } else {
-        auto [v, _] = heap_peek();
-        best = v;
-    }
+    auto [best, _] = heap_peek();
     auto t1 = clock::now();
     rec.find_best_us = std::chrono::duration<double, std::micro>(t1 - t0).count();
 
