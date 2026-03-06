@@ -56,14 +56,6 @@ class DecisionMesh:
             if v.parent_edge is not None:
                 v.update_info()
 
-    def _empty_mask(self) -> pd.Series:
-        """Default factory for ownership: a fresh all-False mask aligned to data."""
-        return pd.Series(False, index=self.index, dtype=bool)
-
-    def _empty_coeff(self) -> pd.Series:
-        """All-zero coefficients aligned to dataset index."""
-        return pd.Series(0.0, index=self.index, dtype=float)
-
     def _faces_and_weights(self, eps: float = 1e-12):
         """
         Active faces only. Returns (faces, weights) where
@@ -77,9 +69,7 @@ class DecisionMesh:
             return [], np.array([], dtype=float)
 
         areas = np.array([float(getattr(f, "area", 0.0)) for f in faces], dtype=float)
-        # count points in each face via mask
-        counts = np.array([int(getattr(f, "mask", None).sum()) if getattr(f, "mask", None) is not None else 0
-                           for f in faces], dtype=float)
+        counts = np.array([f.n_covered for f in faces], dtype=float)
 
         mask = np.isfinite(areas) & (areas >= 0.0)
         faces  = [f for f, keep in zip(faces, mask) if keep]

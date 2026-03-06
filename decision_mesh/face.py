@@ -3,7 +3,6 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import numpy as np
-import pandas as pd
 from matplotlib.patches import Polygon
 
 from ._helpers import _r
@@ -27,7 +26,7 @@ class Face:
     _seq = 0
 
     def __init__(self, mesh: DecisionMesh, edge0: Edge, edge1: Edge, edge2: Edge,
-                 mask, active: bool = True, path=''):
+                 mask, active: bool = True, path='', skip_coords=False):
         self._id = Face._seq; Face._seq += 1
         self.path = path
         self.mesh = mesh
@@ -45,7 +44,19 @@ class Face:
             vertex2, vertex1 = vertex1, vertex2
             vertex0 = self.edges[2].other_vertex(vertex1)
         self.vertices = [vertex0, vertex1, vertex2]
-        self.update_coords()
+
+        # Sufficient statistics for regression
+        # S_ww[i][j] = sum of w_i * w_j over all points in face
+        # S_wy[i]    = sum of w_i * y over all points in face
+        # S_yy       = sum of y^2 over all points in face
+        self.S_ww = np.zeros((3, 3), dtype=np.float64)
+        self.S_wy = np.zeros(3, dtype=np.float64)
+        self.S_yy = 0.0
+        self.n_covered = 0
+        self.coords_indices = []
+
+        if not skip_coords:
+            self.update_coords()
 
         self.active = False
         if active:
@@ -58,10 +69,7 @@ class Face:
     def __repr__(self):
         vs = ",".join(getattr(v, "sid", "V?") for v in self.vertices)
         es = ",".join(getattr(e, "sid", "E?") for e in self.edges)
-        try:
-            npts = int(self.mask.sum())
-        except Exception:
-            npts = "?"
+        npts = self.n_covered
         # show which edges have created sub-divisions
         split_flags = "".join('1' if sd['e'] is not None else '0' for sd in self.sub_divisions)
         return (f"<{self.sid} path='{self.path}' active={self.active} "
@@ -81,9 +89,6 @@ class Face:
     def split(self, edge: Edge):
         if edge is not self.edges[0]:
             # Completion: must split along refinement edge first.
-            # After this, the face is replaced by children; the caller's
-            # while-loop in Edge.split() will pick up the child that
-            # now shares `edge`.
             self.edges[0].midpoint.activate()
             return
 
@@ -117,44 +122,161 @@ class Face:
     def area(self):
         #Shoelace Formula
         det = (self.vertices[0].x - self.vertices[2].x)*(self.vertices[1].y - self.vertices[0].y) - (self.vertices[0].x-self.vertices[1].x) * (self.vertices[2].y - self.vertices[0].y)
-        return 0.5 * np.abs(det)
+        return 0.5 * abs(det)
 
     def aspect_ratio(self):
         return max(edge.length for edge in self.edges)/min(edge.length for edge in self.edges)
 
     def update_coords(self, eps=1e-14):
         """
-        Compute barycentric weights for the rows where this face's mask is True.
-        Stores a DataFrame in self.coords with:
-        rows  = dataset index restricted to face.mask
-        cols  = [v0, v1, v2] (the actual Vertex objects)
-        values = [w0, w1, w2]
+        Compute barycentric weights and accumulate sufficient statistics
+        for all points where this face's mask is True.
+
+        Stores coords_indices (list of int point indices), and
+        S_ww, S_wy, S_yy sufficient statistics for regression.
         """
-        rows = self.mesh.index[self.mask]  # pandas Index aligned to dataset
-        X = self.mesh.X[self.mask]         # (n,2) points in this face
+        self.coords_indices = []
+        self.S_ww[:] = 0.0
+        self.S_wy[:] = 0.0
+        self.S_yy = 0.0
+        self.n_covered = 0
 
-        a = self.vertices[1] - self.vertices[0]
-        b = self.vertices[2] - self.vertices[0]
-        p = X - self.vertices[0]
+        v0 = self.vertices[0]
+        v1 = self.vertices[1]
+        v2 = self.vertices[2]
 
-        d00 = np.dot(a, a)
-        d01 = np.dot(a, b)
-        d11 = np.dot(b, b)
-        d20 = p @ a
-        d21 = p @ b
+        # Right-triangle optimization: v0 is opposite hypotenuse
+        # Legs a = v1-v0, b = v2-v0
+        ax = v1.x - v0.x; ay = v1.y - v0.y
+        bx = v2.x - v0.x; by = v2.y - v0.y
 
-        denom = d00 * d11 - d01 * d01
-        if abs(denom) < eps:
-            n = len(X)
-            W = np.column_stack([np.full(n, np.nan), np.full(n, np.nan), np.full(n, np.nan)])
+        d00 = ax * ax + ay * ay
+        d11 = bx * bx + by * by
+
+        if d00 < eps or d11 < eps:
+            # Degenerate triangle — just collect indices
+            X = self.mesh.X
+            mask = self.mask
+            for i in range(len(mask)):
+                if mask[i]:
+                    self.coords_indices.append(i)
+            self.n_covered = len(self.coords_indices)
+            return
+
+        inv_d00 = 1.0 / d00
+        inv_d11 = 1.0 / d11
+        v0x = v0.x; v0y = v0.y
+
+        X = self.mesh.X
+        values = self.mesh.values
+        mask = self.mask
+
+        # Vectorized: get indices where mask is True
+        indices = np.flatnonzero(mask)
+        if len(indices) == 0:
+            return
+
+        # Vectorized barycentric computation
+        px = X[indices, 0] - v0x
+        py = X[indices, 1] - v0y
+        u = (px * ax + py * ay) * inv_d00
+        v = (px * bx + py * by) * inv_d11
+        w0 = 1.0 - u - v
+        y = values[indices]
+
+        self.coords_indices = indices.tolist()
+        self.n_covered = len(indices)
+
+        # Accumulate sufficient statistics vectorized
+        W = np.column_stack([w0, u, v])  # (n, 3)
+        self.S_ww = W.T @ W              # (3, 3)
+        self.S_wy = W.T @ y              # (3,)
+        self.S_yy = float(y @ y)
+
+    def update_coords_from_indices(self, indices, eps=1e-14):
+        """
+        Fast path: compute sufficient statistics only for given point indices
+        (subset of a parent face). Avoids scanning all N points.
+        """
+        self.coords_indices = []
+        self.S_ww[:] = 0.0
+        self.S_wy[:] = 0.0
+        self.S_yy = 0.0
+        self.n_covered = 0
+
+        if not indices:
+            return
+
+        v0 = self.vertices[0]
+        v1 = self.vertices[1]
+        v2 = self.vertices[2]
+
+        ax = v1.x - v0.x; ay = v1.y - v0.y
+        bx = v2.x - v0.x; by = v2.y - v0.y
+
+        d00 = ax * ax + ay * ay
+        d11 = bx * bx + by * by
+
+        if d00 < eps or d11 < eps:
+            self.coords_indices = list(indices)
+            self.n_covered = len(indices)
+            return
+
+        inv_d00 = 1.0 / d00
+        inv_d11 = 1.0 / d11
+        v0x = v0.x; v0y = v0.y
+
+        X = self.mesh.X
+        values = self.mesh.values
+
+        idx_arr = np.asarray(indices, dtype=np.intp)
+        px = X[idx_arr, 0] - v0x
+        py = X[idx_arr, 1] - v0y
+        u = (px * ax + py * ay) * inv_d00
+        v = (px * bx + py * by) * inv_d11
+        w0 = 1.0 - u - v
+        y = values[idx_arr]
+
+        self.coords_indices = idx_arr.tolist()
+        self.n_covered = len(idx_arr)
+
+        W = np.column_stack([w0, u, v])
+        self.S_ww = W.T @ W
+        self.S_wy = W.T @ y
+        self.S_yy = float(y @ y)
+
+    @property
+    def coords(self):
+        """Backward-compatible property: lazily build a DataFrame of barycentric weights."""
+        import pandas as pd
+        if self.n_covered == 0:
+            return pd.DataFrame(columns=list(self.vertices))
+
+        v0 = self.vertices[0]
+        v1 = self.vertices[1]
+        v2 = self.vertices[2]
+
+        ax = v1.x - v0.x; ay = v1.y - v0.y
+        bx = v2.x - v0.x; by = v2.y - v0.y
+        d00 = ax * ax + ay * ay
+        d11 = bx * bx + by * by
+
+        idx_arr = np.array(self.coords_indices, dtype=np.intp)
+        X = self.mesh.X
+
+        if d00 < 1e-14 or d11 < 1e-14:
+            n = len(idx_arr)
+            W = np.full((n, 3), np.nan)
         else:
-            u = (d11 * d20 - d01 * d21) / denom
-            v = (d00 * d21 - d01 * d20) / denom
+            px = X[idx_arr, 0] - v0.x
+            py = X[idx_arr, 1] - v0.y
+            u = (px * ax + py * ay) / d00
+            v = (px * bx + py * by) / d11
             w0 = 1.0 - u - v
             W = np.column_stack([w0, u, v])
 
-        # DataFrame with Vertex-object columns
-        self.coords = pd.DataFrame(W, index=rows, columns=list(self.vertices))
+        rows = self.mesh.index[idx_arr]
+        return pd.DataFrame(W, index=rows, columns=list(self.vertices))
 
     def add_sub_division(self, edge: Edge, sub_division: dict):
         idx = self.edges.index(edge)

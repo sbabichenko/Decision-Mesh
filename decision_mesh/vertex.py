@@ -4,7 +4,6 @@ import math
 from typing import TYPE_CHECKING
 
 import numpy as np
-import pandas as pd
 
 from ._helpers import _r
 
@@ -254,33 +253,13 @@ class Vertex:
         neighbors = {v for f in faces for v in f.vertices if v is not self}
         return neighbors, faces
 
-    def build_design_matrix(self, faces):
-        mask_union = pd.Series(False, index=self.mesh.index, dtype=bool)
-        for f in faces:
-            mask_union |= f.mask
-        rows = mask_union[mask_union].index
-
-        cols = set().union(*(set(f.vertices) for f in faces))
-        col_key = {v: v._id for v in cols}
-        X = pd.DataFrame(0.0, index=rows, columns=[col_key[v] for v in cols])
-
-        # Use the mapped keys when writing/reading
-        for f in faces:
-            W = f.coords.copy()
-            W.columns = [col_key[v] for v in f.vertices]  # map Vertex->stable scalar
-            X.loc[W.index, W.columns] = W.values
-
-        return X, rows, col_key
-
     def loc_regress(self):
         """
         Fit this vertex's optimal height given neighbors fixed.
 
-        - Collect faces touching this vertex (or simulated if inactive).
-        - Build design matrix from barycentric weights.
-        - Subtract fixed contribution of neighbors.
-        - Solve 1D least-squares for this vertex's best height.
-        - Return (beta_opt, loss_reduction, neighbors, n_points).
+        Uses per-face sufficient statistics (S_ww, S_wy, S_yy) to compute
+        the 1D least-squares solution in O(faces) time, without iterating
+        over individual data points.
         """
         # 1) which faces / neighbors?
         if self.active:
@@ -291,34 +270,58 @@ class Vertex:
         if not faces:
             return float(self.height), 0.0, neighbors, 0, 0.0, 0.0, 0.0
 
-        # 2) design matrix for those faces
-        X, rows, col_key = self.build_design_matrix(faces)
-        points_attached = len(X)
-        y = pd.Series(self.mesh.values, index=self.mesh.index, dtype=float).loc[rows].to_numpy()
+        # 2) Accumulate sufficient statistics across faces
+        xTx = 0.0
+        xTr = 0.0
+        rTr = 0.0
+        total_points = 0
 
-        # 3) fixed contribution from neighbors ("correction")
-        other_cols = [col_key[v] for v in neighbors if v in col_key]
-        if other_cols:
-            other_heights = np.array([v.height for v in neighbors], dtype=float)
-            correction = X[other_cols].to_numpy() @ other_heights
-        else:
-            correction = np.zeros_like(y)
+        for f in faces:
+            # Find which vertex index in this face is "self"
+            si = -1
+            for i in range(3):
+                if f.vertices[i] is self:
+                    si = i
+                    break
+            if si < 0 or f.n_covered == 0:
+                continue
 
-        # 4) column for self (the only regressor)
-        x = X[col_key[self]].to_numpy().astype(float)
+            total_points += f.n_covered
 
-        # 5) residual after removing neighbors
-        r = y - correction
+            # Gather neighbor heights for this face
+            h = [f.vertices[0].height, f.vertices[1].height, f.vertices[2].height]
 
-        # 6) original loss with current self.height
+            xTx += f.S_ww[si, si]
+
+            # xTr contribution
+            xTr_face = f.S_wy[si]
+            for j in range(3):
+                if j == si:
+                    continue
+                xTr_face -= h[j] * f.S_ww[si, j]
+            xTr += xTr_face
+
+            # rTr contribution: ||y - sum_{j!=si} w_j h_j||^2
+            rTr_face = f.S_yy
+            for j in range(3):
+                if j == si:
+                    continue
+                rTr_face -= 2.0 * h[j] * f.S_wy[j]
+                for k in range(3):
+                    if k == si:
+                        continue
+                    rTr_face += h[j] * h[k] * f.S_ww[j, k]
+            rTr += rTr_face
+
+        if total_points == 0:
+            return float(self.height), 0.0, neighbors, 0, 0.0, 0.0, 0.0
+
+        # Original loss with current height
         beta_orig = float(self.height)
-        orig_loss = float(((r - x * beta_orig) ** 2).sum())
+        orig_loss = rTr - 2.0 * beta_orig * xTr + beta_orig * beta_orig * xTx
 
-        # 7) optimal 1D least-squares for beta (self only)
-        xTx = float(x @ x)
-        rTr = float(r @ r)
+        # Optimal 1D least squares
         if xTx > 0.0:
-            xTr = float(x @ r)
             beta_opt = xTr / xTx
             sse_post = rTr - (xTr * xTr) / xTx
         else:
@@ -328,7 +331,7 @@ class Vertex:
 
         loss_reduction = orig_loss - sse_post
 
-        return float(beta_opt), float(loss_reduction), neighbors, points_attached, xTx, xTr, rTr
+        return float(beta_opt), float(loss_reduction), neighbors, total_points, xTx, xTr, rTr
 
     # --- Empirical Bayes helpers ---
 
@@ -351,9 +354,9 @@ class Vertex:
         faces_b = faces_of(b)
         shared = faces_a & faces_b
 
-        n_shared = sum(int(f.mask.sum()) for f in shared)
-        n_a = sum(int(f.mask.sum()) for f in faces_a)
-        n_b = sum(int(f.mask.sum()) for f in faces_b)
+        n_shared = sum(f.n_covered for f in shared)
+        n_a = sum(f.n_covered for f in faces_a)
+        n_b = sum(f.n_covered for f in faces_b)
 
         denom = n_a + n_b - n_shared
         if denom <= 0:
