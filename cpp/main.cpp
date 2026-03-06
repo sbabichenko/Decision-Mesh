@@ -15,8 +15,7 @@
 #include <vector>
 #include <algorithm>
 
-static void generate_demo_data(int n, double noise_scale,
-                               std::vector<double>& x,
+static void generate_demo_data(int n, std::vector<double>& x,
                                std::vector<double>& y, std::vector<double>& z) {
     std::mt19937 gen(42);
     std::uniform_real_distribution<double> unif(-4.0, 4.0);
@@ -28,7 +27,7 @@ static void generate_demo_data(int n, double noise_scale,
     for (int i = 0; i < n; ++i) {
         x[i] = unif(gen);
         y[i] = unif(gen);
-        z[i] = noise_scale * norm(gen) + 2.0 * std::cos(5.0 * x[i]) * std::cos(2.0 * y[i]);
+        z[i] = norm(gen) + 2.0 * std::cos(5.0 * x[i]) * std::cos(2.0 * y[i]);
     }
 }
 
@@ -139,7 +138,6 @@ int main(int argc, char** argv) {
     int n_points = 200000;
     int time_limit_sec = 90;
     double test_frac = 0.2;
-    double noise_scale = 1.0;
     std::string csv_path;
 
     for (int i = 1; i < argc; ++i) {
@@ -152,14 +150,11 @@ int main(int argc, char** argv) {
             csv_path = argv[++i];
         } else if (arg == "-f" && i + 1 < argc) {
             test_frac = std::atof(argv[++i]);
-        } else if (arg == "-s" && i + 1 < argc) {
-            noise_scale = std::atof(argv[++i]);
         } else if (arg == "-h" || arg == "--help") {
-            printf("Usage: decision_mesh [-n points] [-t seconds] [-f test_frac] [-s noise] [-i input.csv]\n");
+            printf("Usage: decision_mesh [-n points] [-t seconds] [-f test_frac] [-i input.csv]\n");
             printf("  -n  Number of generated data points (default: 200000)\n");
             printf("  -t  Time limit for refinement in seconds (default: 90)\n");
             printf("  -f  Fraction of data held out for testing (default: 0.2)\n");
-            printf("  -s  Noise standard deviation scale (default: 1.0, use 0 for noiseless)\n");
             printf("  -i  Input CSV file (x,y,z columns). If omitted, generates demo data.\n");
             return 0;
         }
@@ -176,8 +171,8 @@ int main(int argc, char** argv) {
         n_points = (int)x_all.size();
         printf("Loaded %d points.\n", n_points);
     } else {
-        printf("Generating %d demo data points (noise_scale=%.2f)...\n", n_points, noise_scale);
-        generate_demo_data(n_points, noise_scale, x_all, y_all, z_all);
+        printf("Generating %d demo data points...\n", n_points);
+        generate_demo_data(n_points, x_all, y_all, z_all);
     }
 
     // --- Train/test split ---

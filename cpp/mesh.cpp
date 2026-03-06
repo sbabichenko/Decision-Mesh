@@ -214,7 +214,7 @@ TimingRecord DecisionMesh::update_best_vertex_timed(double random_prob, int iter
     if (best->active) {
         best->height = best->new_height;
         if (best->parent_edge != nullptr) {
-            best->delta_data = best->height - best->mu_lin();
+            best->delta_pooled = best->height - best->mu_lin();
         }
         auto t2b = clock::now();
         std::set<Vertex*> to_update(best->affected_vertices);
@@ -234,9 +234,12 @@ TimingRecord DecisionMesh::update_best_vertex_timed(double random_prob, int iter
         best->active = true;
         best->height = best->new_height;
 
-        // Record detail coefficient before split
+        // Set EB posterior fields before split
         if (use_eb && best->parent_edge != nullptr) {
-            best->delta_data = best->height - best->mu_lin();
+            best->delta_pooled = best->height - best->mu_lin();
+            double inv_sigma = (best->sigma_sq < 1e300) ? (1.0 / best->sigma_sq) : 0.0;
+            double xTx_reg = inv_sigma + best->lambda_v;
+            best->sigma_pooled = (xTx_reg > 0) ? (1.0 / xTx_reg) : 1e300;
         }
 
         best->parent_edge->split();
@@ -270,9 +273,6 @@ TimingRecord DecisionMesh::update_best_vertex_timed(double random_prob, int iter
 // --- Empirical Bayes ---
 
 void DecisionMesh::recompute_tau_sq() {
-    // Wavelet spike-and-slab hyperparameter estimation per depth.
-    // Estimates tau_sq_d (slab variance) and pi_d (signal probability).
-
     // Group non-corner vertices by depth
     std::map<int, std::vector<Vertex*>> by_depth;
     for (Vertex* v : vertices) {
@@ -285,55 +285,30 @@ void DecisionMesh::recompute_tau_sq() {
         int m = (int)verts.size();
         tau_sq_vertex_counts[d] = m;
 
-        if (m < 5) continue;  // need >= 5 for reliable estimation
+        if (m < 3) continue;
 
-        // --- Step 2b: tau_sq via method of moments ---
-        // S_d = (1/m) * sum(delta_data^2 - sigma_sq)
-        double sum_excess = 0.0;
+        double sum_w = 0.0;
+        double sum_wd = 0.0;
         for (Vertex* v : verts) {
-            sum_excess += v->delta_data * v->delta_data - v->sigma_sq;
+            double w = 1.0 / v->sigma_sq;
+            sum_w += w;
+            sum_wd += v->delta_pooled * w;
         }
-        double tau2 = std::max(0.0, sum_excess / m);
-        tau_sq[d] = tau2;
+        if (sum_w <= 0) continue;
 
-        // --- Step 2c: pi_d via threshold estimator, then EM refinement ---
-        if (tau2 <= 0) {
-            // No signal at this depth
-            pi_d[d] = 1.0 / m;  // floor
-            continue;
-        }
+        double mu_d = sum_wd / sum_w;
+        mu_delta[d] = mu_d;
 
-        // Initial estimate: fraction of vertices with |delta| > 2*sigma
-        int n_sig = 0;
+        double chi_sq = 0.0;
         for (Vertex* v : verts) {
-            double sigma_v = std::sqrt(v->sigma_sq);
-            if (std::abs(v->delta_data) > 2.0 * sigma_v) n_sig++;
+            double diff = v->delta_pooled - mu_d;
+            chi_sq += diff * diff / v->sigma_sq;
         }
-        double pi_init = std::max(1.0 / m, (double)n_sig / m);
-
-        // EM refinement (3 iterations) using marginal likelihood
-        double pi_est = pi_init;
-        for (int iter = 0; iter < 3; ++iter) {
-            double sum_resp = 0.0;
-            for (Vertex* v : verts) {
-                double sig2 = v->sigma_sq;
-                double d2 = v->delta_data * v->delta_data;
-                // log BF = 0.5*log(sig2/(sig2+tau2)) + d2*tau2/(2*sig2*(sig2+tau2))
-                double ratio = sig2 / (sig2 + tau2);
-                double log_bf = 0.5 * std::log(ratio) + d2 * tau2 / (2.0 * sig2 * (sig2 + tau2));
-                double log_odds = std::log(pi_est / (1.0 - pi_est)) + log_bf;
-                double resp;
-                if (log_odds > 30.0) resp = 1.0;
-                else if (log_odds < -30.0) resp = 0.0;
-                else resp = 1.0 / (1.0 + std::exp(-log_odds));
-                sum_resp += resp;
-            }
-            pi_est = std::max(1.0 / m, std::min(1.0, sum_resp / m));
-        }
-        pi_d[d] = pi_est;
+        double tau = std::max(0.0, (chi_sq - (m - 1)) / sum_w);
+        tau_sq[d] = tau;
     }
 
-    // For depths with < 5 vertices, borrow from nearest depth with estimates
+    // For depths with < 3 vertices, borrow from nearest depth
     std::vector<int> depths_with_tau;
     for (auto& [d, _] : tau_sq) depths_with_tau.push_back(d);
     std::sort(depths_with_tau.begin(), depths_with_tau.end());
@@ -346,15 +321,10 @@ void DecisionMesh::recompute_tau_sq() {
                     if (std::abs(d2 - d) < std::abs(nearest - d)) nearest = d2;
                 }
                 tau_sq[d] = tau_sq[nearest];
-            }
-            if (pi_d.find(d) == pi_d.end()) {
-                // Default: borrow or fallback
-                int nearest = depths_with_tau[0];
-                for (int d2 : depths_with_tau) {
-                    if (std::abs(d2 - d) < std::abs(nearest - d)) nearest = d2;
+                if (mu_delta.find(d) == mu_delta.end()) {
+                    auto it = mu_delta.find(nearest);
+                    mu_delta[d] = (it != mu_delta.end()) ? it->second : 0.0;
                 }
-                auto it = pi_d.find(nearest);
-                pi_d[d] = (it != pi_d.end()) ? it->second : 0.5;
             }
         }
     }
@@ -537,13 +507,16 @@ void DecisionMesh::write_mesh_csv(const std::string& prefix) const {
         vid[v] = next_id++;
     }
 
-    // Write vertices: id, x, y, height, shrinkage, inclusion_prob, depth
+    // Write vertices: id, x, y, height, shrinkage, depth
     {
         std::ofstream out(prefix + "_vertices.csv");
-        out << "id,x,y,height,shrinkage,inclusion_prob,depth\n";
+        out << "id,x,y,height,shrinkage,depth\n";
         for (const Vertex* v : vertices) {
+            // shrinkage = lambda_v / (lambda_v + xTx), where xTx = 1/sigma_sq
+            double xTx = (v->sigma_sq > 0 && v->sigma_sq < 1e200) ? 1.0 / v->sigma_sq : 0.0;
+            double shrinkage = (v->lambda_v + xTx > 0) ? v->lambda_v / (v->lambda_v + xTx) : 0.0;
             out << vid[v] << "," << v->x << "," << v->y << "," << v->height
-                << "," << v->s_v << "," << v->p_v << "," << v->depth << "\n";
+                << "," << shrinkage << "," << v->depth << "\n";
         }
     }
 

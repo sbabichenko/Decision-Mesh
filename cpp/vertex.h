@@ -30,13 +30,13 @@ struct Vertex {
     std::set<Vertex*> affected_vertices;
     int affected_points = 0;
 
-    // Wavelet spike-and-slab empirical Bayes fields
+    // Empirical Bayes partial pooling fields
     int depth = 0;
     double sigma_sq = 1e300;       // data-only variance (1/xTx)
-    double delta_data = 0.0;       // data-only detail coefficient: beta_data - mu_lin
-    double p_v = 0.0;             // posterior inclusion probability
-    double s_v = 0.0;             // effective shrinkage factor: p_v * tau^2 / (tau^2 + sigma^2)
-    double lambda_v = 0.0;        // effective regularization: xTx * (1 - s) / s
+    double delta_pooled = 0.0;     // height - mu_lin
+    double sigma_pooled = 1e300;   // posterior variance
+    double lambda_v = 0.0;        // prior precision (1/sigma_prior)
+    double prior_mean = 0.0;      // EB prior mean
     std::set<Vertex*> prior_children;  // vertices on this vertex's edges (for prior propagation)
 
     Vertex() : _id(-1), x(0), y(0) {}
@@ -77,9 +77,10 @@ struct Vertex {
     };
     LocRegressResult loc_regress();
 
-    // Wavelet EB helpers
+    // Empirical Bayes helpers
     double mu_lin() const;
-    void compute_spike_slab(double xTx, double xTr);  // sets s_v, lambda_v, p_v
+    double compute_overlap_factor(Vertex* a, Vertex* b) const;
+    std::pair<double, double> compute_eb_params(double xTx) const;
 
     int degree() const { return (int)edges.size(); }
 };

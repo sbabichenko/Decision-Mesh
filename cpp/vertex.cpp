@@ -57,9 +57,12 @@ void Vertex::activate() {
     active = true;
     height = new_height;
 
-    // Record detail coefficient before split (children may reference it)
+    // Set EB posterior fields before split (new midpoints need these during split)
     if (mesh->use_eb && parent_edge != nullptr) {
-        delta_data = height - mu_lin();
+        delta_pooled = height - mu_lin();
+        double inv_sigma = (sigma_sq < 1e300) ? (1.0 / sigma_sq) : 0.0;
+        double xTx_reg = inv_sigma + lambda_v;
+        sigma_pooled = (xTx_reg > 0) ? (1.0 / xTx_reg) : 1e300;
     }
 
     parent_edge->split();
@@ -88,11 +91,10 @@ void Vertex::update_info() {
     sigma_sq = (xTx > 0) ? (1.0 / xTx) : 1e300;
 
     if (mesh->use_eb) {
-        compute_spike_slab(xTx, xTr);
+        auto [lv, mu_v] = compute_eb_params(xTx);
+        lambda_v = lv;
 
-        if (lambda_v > 0 && xTx > 0) {
-            double mu_v = mu_lin();  // prior mean = linear interpolation
-            double lv = lambda_v;
+        if (lv > 0 && xTx > 0) {
             double xTx_reg = xTx + lv;
             double xTr_reg = xTr + lv * mu_v;
             double beta_reg = xTr_reg / xTx_reg;
@@ -105,11 +107,14 @@ void Vertex::update_info() {
 
             new_height = beta_reg;
             loss_reduction = std::max(0.0, orig_loss - sse_post);
+            sigma_pooled = 1.0 / xTx_reg;
+            delta_pooled = beta_reg - mu_lin();
         } else {
             new_height = result.beta_opt;
             loss_reduction = result.loss_reduction;
             if (parent_edge != nullptr && xTx > 0) {
-                delta_data = result.beta_opt - mu_lin();
+                delta_pooled = result.beta_opt - mu_lin();
+                sigma_pooled = sigma_sq;
             }
         }
     } else {
@@ -125,7 +130,7 @@ void Vertex::update_info() {
 void Vertex::update_height() {
     height = new_height;
     if (parent_edge != nullptr) {
-        delta_data = height - mu_lin();
+        delta_pooled = height - mu_lin();
     }
     std::set<Vertex*> to_update(affected_vertices);
     if (mesh->use_eb) {
@@ -294,70 +299,96 @@ double Vertex::mu_lin() const {
     return (parent_edge->vertex0->height + parent_edge->vertex1->height) / 2.0;
 }
 
-void Vertex::compute_spike_slab(double xTx, double xTr) {
-    // Sets s_v, lambda_v, p_v using wavelet spike-and-slab posterior.
-    // Prior: delta ~ (1 - pi_d) * delta(0) + pi_d * N(0, tau_sq_d)
-    // Data:  delta_hat | delta ~ N(delta, sigma_sq)
-
-    static constexpr double EPS_S = 1e-6;  // floor for s_v to avoid lambda_v -> inf
-
-    if (parent_edge == nullptr || xTx <= 0) {
-        s_v = 0.0; p_v = 0.0; lambda_v = 0.0;
-        return;
+double Vertex::compute_overlap_factor(Vertex* a, Vertex* b) const {
+    // Collect faces of a
+    std::set<Face*> faces_a, faces_b;
+    for (Edge* e : a->edges) {
+        for (int s = 0; s < 2; ++s) {
+            Face* f = e->faces[s];
+            if (f) {
+                for (int i = 0; i < 3; ++i) {
+                    if (f->vertices[i] == a) { faces_a.insert(f); break; }
+                }
+            }
+        }
+    }
+    for (Edge* e : b->edges) {
+        for (int s = 0; s < 2; ++s) {
+            Face* f = e->faces[s];
+            if (f) {
+                for (int i = 0; i < 3; ++i) {
+                    if (f->vertices[i] == b) { faces_b.insert(f); break; }
+                }
+            }
+        }
     }
 
-    auto tau_it = mesh->tau_sq.find(depth);
-    auto pi_it = mesh->pi_d.find(depth);
-    if (tau_it == mesh->tau_sq.end() || pi_it == mesh->pi_d.end()) {
-        s_v = 0.0; p_v = 0.0; lambda_v = 0.0;
-        return;
+    // shared faces
+    int n_shared = 0, n_a = 0, n_b = 0;
+    for (Face* f : faces_a) n_a += f->n_covered;
+    for (Face* f : faces_b) n_b += f->n_covered;
+    for (Face* f : faces_a) {
+        if (faces_b.count(f)) n_shared += f->n_covered;
     }
 
-    double tau2 = tau_it->second;
-    double pi = pi_it->second;
-    double sig2 = 1.0 / xTx;  // sigma_sq_v
+    int denom = n_a + n_b - n_shared;
+    if (denom <= 0) return 0.0;
+    return (double)n_shared / denom;
+}
 
-    // Data-only detail coefficient
-    double beta_data = xTr / xTx;
-    double ml = mu_lin();
-    double delta_hat = beta_data - ml;
-    delta_data = delta_hat;
+std::pair<double, double> Vertex::compute_eb_params(double xTx) const {
+    if (parent_edge == nullptr || xTx <= 0) return {0.0, 0.0};
 
-    if (tau2 <= 0) {
-        // All spike: full shrinkage to linear interpolation
-        s_v = EPS_S;
-        p_v = 0.0;
-        lambda_v = xTx * (1.0 - EPS_S) / EPS_S;
-        return;
-    }
+    auto it = mesh->tau_sq.find(depth);
+    if (it == mesh->tau_sq.end()) return {0.0, 0.0};
+    double tau = it->second;
 
-    // Bayes factor: slab likelihood / spike likelihood
-    // BF = sqrt(sig2 / (sig2 + tau2)) * exp(delta_hat^2 * tau2 / (2 * sig2 * (sig2 + tau2)))
-    double ratio = sig2 / (sig2 + tau2);
-    double exponent = delta_hat * delta_hat * tau2 / (2.0 * sig2 * (sig2 + tau2));
+    Vertex* a = parent_edge->vertex0;
+    Vertex* b = parent_edge->vertex1;
+    double ml = (a->height + b->height) / 2.0;
 
-    // Clamp exponent to avoid overflow
-    double log_bf = 0.5 * std::log(ratio) + exponent;
-    // BF = exp(log_bf)
+    // Non-corner parents
+    std::vector<Vertex*> non_corner;
+    if (a->parent_edge != nullptr) non_corner.push_back(a);
+    if (b->parent_edge != nullptr) non_corner.push_back(b);
 
-    // Posterior inclusion: p_v = 1 / (1 + ((1-pi)/pi) * exp(-log_bf))
-    double log_odds_prior = std::log(pi / (1.0 - pi));
-    double log_odds_post = log_odds_prior + log_bf;
-
-    if (log_odds_post > 30.0) {
-        p_v = 1.0;
-    } else if (log_odds_post < -30.0) {
-        p_v = 0.0;
+    double delta_prior;
+    if (!non_corner.empty()) {
+        delta_prior = 0.0;
+        for (Vertex* v : non_corner) delta_prior += v->delta_pooled;
+        delta_prior /= non_corner.size();
     } else {
-        p_v = 1.0 / (1.0 + std::exp(-log_odds_post));
+        auto md_it = mesh->mu_delta.find(depth);
+        delta_prior = (md_it != mesh->mu_delta.end()) ? md_it->second : 0.0;
     }
 
-    // Slab shrinkage component
-    double slab_shrink = tau2 / (tau2 + sig2);
+    double mu_v = ml + delta_prior;
 
-    // Combined shrinkage
-    s_v = std::max(EPS_S, p_v * slab_shrink);
+    double overlap_frac = compute_overlap_factor(a, b);
+    double s_v = 1.0 / std::max(1e-15, 1.0 - overlap_frac);
 
-    // Effective regularization: lambda_v = xTx * (1 - s_v) / s_v
-    lambda_v = xTx * (1.0 - s_v) / s_v;
+    double sigma_prior;
+    std::vector<double> parent_sigmas;
+    for (Vertex* v : non_corner) {
+        if (v->sigma_pooled < 1e300) {
+            parent_sigmas.push_back(v->sigma_pooled);
+        }
+    }
+    if (!parent_sigmas.empty()) {
+        double avg_sigma = 0.0;
+        for (double s : parent_sigmas) avg_sigma += s;
+        avg_sigma /= parent_sigmas.size();
+        sigma_prior = tau + s_v * avg_sigma;
+    } else {
+        sigma_prior = tau;
+    }
+
+    double lv;
+    if (sigma_prior <= 0) {
+        lv = 1e12;
+    } else {
+        lv = 1.0 / sigma_prior;
+    }
+
+    return {lv, mu_v};
 }
