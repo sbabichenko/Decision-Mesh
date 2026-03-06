@@ -507,12 +507,16 @@ void DecisionMesh::write_mesh_csv(const std::string& prefix) const {
         vid[v] = next_id++;
     }
 
-    // Write vertices: id, x, y, height
+    // Write vertices: id, x, y, height, shrinkage, depth
     {
         std::ofstream out(prefix + "_vertices.csv");
-        out << "id,x,y,height\n";
+        out << "id,x,y,height,shrinkage,depth\n";
         for (const Vertex* v : vertices) {
-            out << vid[v] << "," << v->x << "," << v->y << "," << v->height << "\n";
+            // shrinkage = lambda_v / (lambda_v + xTx), where xTx = 1/sigma_sq
+            double xTx = (v->sigma_sq > 0 && v->sigma_sq < 1e200) ? 1.0 / v->sigma_sq : 0.0;
+            double shrinkage = (v->lambda_v + xTx > 0) ? v->lambda_v / (v->lambda_v + xTx) : 0.0;
+            out << vid[v] << "," << v->x << "," << v->y << "," << v->height
+                << "," << shrinkage << "," << v->depth << "\n";
         }
     }
 
