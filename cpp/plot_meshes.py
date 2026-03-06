@@ -62,7 +62,7 @@ def main():
     tpc1 = axes[1].tripcolor(tri_noreg, noreg_h_clipped, shading="gouraud",
                               cmap="RdBu_r", vmin=-vlim, vmax=vlim, rasterized=True)
     axes[1].set_aspect("equal", "box")
-    axes[1].set_title(f"No Regularization\n({n_noreg:,} faces{sub_label}, test MSE ~863)",
+    axes[1].set_title(f"No Regularization\n({n_noreg:,} faces{sub_label}, test MSE ~2.26)",
                       fontsize=12, fontweight="bold")
     fig.colorbar(tpc1, ax=axes[1], shrink=0.75)
 
@@ -72,12 +72,12 @@ def main():
     tpc2 = axes[2].tripcolor(tri_eb, eb_v["height"].values, shading="gouraud",
                               cmap="RdBu_r", vmin=-vlim, vmax=vlim, rasterized=True)
     axes[2].set_aspect("equal", "box")
-    axes[2].set_title(f"Empirical Bayes\n({n_eb:,} faces, test MSE ~2.8)",
+    axes[2].set_title(f"Empirical Bayes (Spike-and-Slab)\n({n_eb:,} faces, test MSE ~2.11)",
                       fontsize=12, fontweight="bold")
     fig.colorbar(tpc2, ax=axes[2], shrink=0.75)
 
     fig.suptitle("Decision Mesh: Ground Truth vs No Reg vs Empirical Bayes\n"
-                 "(200k points, 80/20 split, 90s refinement)",
+                 "(200k noiseless points, 80/20 split, 90s refinement)",
                  fontsize=14, fontweight="bold", y=1.0)
     plt.tight_layout()
     out1 = "mesh_comparison.png"

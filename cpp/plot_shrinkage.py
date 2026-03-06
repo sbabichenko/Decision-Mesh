@@ -49,7 +49,7 @@ def main():
     cb_p = fig.colorbar(tpc_p, ax=ax_p, shrink=0.75)
     cb_p.set_label(r"$p_v$    [0 = spike (linear), 1 = slab (curvature)]")
 
-    fig.suptitle(f"Wavelet Spike-and-Slab EB: Height / Shrinkage / Inclusion ({len(tris):,} faces)",
+    fig.suptitle(f"Wavelet Spike-and-Slab EB — Noiseless: Height / Shrinkage / Inclusion ({len(tris):,} faces)",
                  fontsize=14, fontweight="bold", y=1.0)
     plt.tight_layout()
     out = "mesh_shrinkage.png"
